@@ -1,0 +1,8 @@
+# Skills installed by default during arc-setup.
+# One skill name per line. These must have mandatory: true in their SKILL.md.
+# All other skills can be installed on demand:
+#   npx skills add ansible-automation-platform/harness --skill <name>
+arc
+git-workflow
+jira-integration
+session-recorder
