@@ -101,10 +101,13 @@ oc delete pvc isf-bkprstr-claim logcollector -n "$FUSION_NS" 2>/dev/null || true
 
 ### 4. Run the cleanup script (Phase 2)
 
-The script `delete-df-storage.sh` is bundled in this skill directory.
+Download and run the `delete-fusion-odf.sh` script from the [Fusion runbooks](https://github.ibm.com/ProjectAbell/fusion-runbooks):
 
 ```bash
-bash <path-to-skill>/delete-df-storage.sh 2>&1 | tee /tmp/delete-df-storage-$(date +%Y%m%d-%H%M%S).log
+curl -sSL -o /tmp/delete-df-storage.sh \
+  https://raw.github.ibm.com/ProjectAbell/fusion-runbooks/main/tools/delete-fusion-odf.sh
+
+bash /tmp/delete-df-storage.sh 2>&1 | tee /tmp/delete-df-storage-$(date +%Y%m%d-%H%M%S).log
 ```
 
 The script runs 15 automated steps: StorageCluster annotation, PVC/OBC safety check, StorageConsumer/Client/System deletion, namespace cleanup with finalizer fallback, rook data cleanup, encrypted disk check, LSO cleanup, PV finalizer clearing, StorageClass deletion, node unlabeling, and operator removal.
