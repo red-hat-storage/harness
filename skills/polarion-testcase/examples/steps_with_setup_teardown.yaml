@@ -1,0 +1,17 @@
+steps:
+  - step: "Create a Block application PVC and a Block-mode copy PVC."
+    expected: "Both PVCs are created and reach Bound status."
+  - step: "Create a writer pod and write 10 MiB of data."
+    expected: "Writer pod is Running, 10 MiB file is written to the PVC."
+  - step: "Take a VolumeSnapshot of the PVC."
+    expected: "VolumeSnapshot is created and reaches readyToUse state."
+  - step: "Run the CBT lister and verify allocated blocks are returned."
+    expected: "Lister returns at least one allocated block entry for the PVC containing 10 MiB of data."
+  - step: "Restore the snapshot, run the CBT verifier, and assert it exits with code 0."
+    expected: "Snapshot is restored to a Block PVC, the verifier copies allocated blocks and confirms byte-for-byte match (exit code 0)."
+setup:
+  - step: "Create a project, CBT runner (RBAC, CA cert, tools pod), and store factory references."
+    expected: "Project namespace is created, VerifierTool is initialized and setup completes."
+teardown:
+  - step: "Clean up the CBT runner (removes RBAC, tools pod, CA cert)."
+    expected: "All CBT runner resources are removed from the namespace."
