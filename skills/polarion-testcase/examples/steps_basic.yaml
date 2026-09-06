@@ -1,0 +1,7 @@
+steps:
+  - step: "Navigate to Storage > StorageClasses page."
+    expected: "StorageClasses page loads and shows all available storage classes."
+  - step: "Click on the RBD storage class."
+    expected: "Storage class detail page opens with correct name and provisioner."
+  - step: "Verify the Parameters section displays the pool name."
+    expected: "Parameters table shows pool key with the expected CephBlockPool name."

@@ -1,0 +1,17 @@
+Steps:
+1. Create a PVC with RBD storage class and verify it reaches Bound status.
+   Expected: PVC is created and status is Bound within 60 seconds.
+2. Create a pod that mounts the PVC and write 512 MiB of data.
+   Expected: Pod is Running and data write completes without errors.
+3. Delete the pod and verify the PVC remains Bound.
+   Expected: Pod is deleted, PVC status is still Bound.
+4. Create a new pod mounting the same PVC and verify data integrity.
+   Expected: New pod is Running and previously written data is intact.
+
+Setup:
+1. Deploy ODF cluster with default configuration.
+   Expected: ODF cluster is healthy and all pods are Running.
+
+Teardown:
+1. Delete all created PVCs and pods.
+   Expected: All test resources are removed from the namespace.

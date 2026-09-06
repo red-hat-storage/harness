@@ -1,0 +1,17 @@
+steps:
+  - step: "Scale down the rook-ceph-mon deployment to 0 replicas."
+    expected: "Mon deployment replica count is 0 and mon pod is terminated."
+  - step: "Wait for the CephHealthError alert to fire."
+    expected: "CephHealthError alert is in Firing state within 5 minutes."
+  - step: "Scale the mon deployment back to 1 replica."
+    expected: "Mon pod is Running and CephHealthError alert resolves."
+setup:
+  - step: "Deploy ODF cluster with 3 mon pods."
+    expected: "All 3 mon pods are Running and Ceph health is HEALTH_OK."
+  - step: "Record the initial mon deployment replica count."
+    expected: "Replica count is captured for later restoration."
+teardown:
+  - step: "Restore the mon deployment replica count to the original value."
+    expected: "Mon deployment replicas match the pre-test count."
+  - step: "Wait for Ceph health to return to HEALTH_OK."
+    expected: "Ceph cluster health is HEALTH_OK within 10 minutes."
