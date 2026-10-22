@@ -24,7 +24,6 @@ from constants import (
     EXTRACT_PROMPT,
     MARKS_MODULE,
     MAX_LINE,
-    PARAM_MAX_LINE,
     POLARION_BASE,
     POLARION_REDIRECT,
     PROJECT,
@@ -1213,7 +1212,9 @@ def _defined_names(tree: ast.AST) -> set:
     }
 
 
-def validate_edit(source: str, updated: str) -> str:
+def validate_edit(
+    source: str, updated: str, check_size: bool = True
+) -> str:
     """Return an error string if an edited file looks unsafe to write.
 
     Guards against a truncated or summarised rewrite silently destroying
@@ -1237,21 +1238,27 @@ def validate_edit(source: str, updated: str) -> str:
             "the new content is missing "
             f"{len(dropped)} definition(s): {', '.join(sorted(dropped))}"
         )
-    if len(updated) < len(source) * 0.9:
+    # Only meaningful when the whole file was rewritten. A splice is
+    # confined to one node, so shrinking there is a legitimate edit.
+    if check_size and len(updated) < len(source) * 0.9:
         shrink = 100 - int(len(updated) / len(source) * 100)
         return f"the new content is {shrink}% smaller than the original"
     return ""
 
 
 def apply_edit(
-    file_path: Path, source: str, updated: str, confirm: bool = True
+    file_path: Path,
+    source: str,
+    updated: str,
+    confirm: bool = True,
+    check_size: bool = True,
 ) -> bool:
     """Validate, show, confirm and write an edited file."""
     if updated == source:
         print("  No changes needed.")
         return False
 
-    problem = validate_edit(source, updated)
+    problem = validate_edit(source, updated, check_size=check_size)
     if problem:
         print(f"  REFUSING to write {file_path.name}: {problem}.")
         print("  The file has been left untouched.")
@@ -1458,15 +1465,14 @@ def _polarion_ids_in(node: ast.AST) -> list:
     return ids
 
 
-def _merged_marks(source: str, marks_kw, mark: str) -> str:
-    """Return the marks= source with the new mark folded in."""
+def _marks_elements(source: str, marks_kw, mark: str) -> list:
+    """Return the marks entries, with the new mark appended."""
     if marks_kw is None:
-        return mark
+        return [mark]
     value = marks_kw.value
     if isinstance(value, (ast.List, ast.Tuple)):
-        elts = [_segment(source, e) for e in value.elts]
-        return "[" + ", ".join(elts + [mark]) + "]"
-    return f"[{_segment(source, value)}, {mark}]"
+        return [_segment(source, e) for e in value.elts] + [mark]
+    return [_segment(source, value), mark]
 
 
 def _param_pieces(source: str, node: ast.AST) -> tuple:
@@ -1486,21 +1492,6 @@ def _param_pieces(source: str, node: ast.AST) -> tuple:
     if isinstance(node, ast.Tuple):
         return [_segment(source, e) for e in node.elts], []
     return [_segment(source, node)], []
-
-
-def _expand_param(
-    source: str, node: ast.AST, marks_src: str, indent: str
-) -> str:
-    """Rebuild a param across several lines, carrying marks_src.
-
-    The existing marks= is folded into marks_src by the caller, so it
-    is dropped here rather than emitted a second time.
-    """
-    inner = indent + "    "
-    args, kws = _param_pieces(source, node)
-    parts = args + kws + [f"marks={marks_src}"]
-    body = "".join(f"{inner}{p},\n" for p in parts)
-    return f"pytest.param(\n{body}{indent})"
 
 
 def add_param_polarion_id(
@@ -1561,8 +1552,6 @@ def add_param_polarion_id(
 
     node = argvalues.elts[param_index]
     mark = f'pytest.mark.polarion_id("{wi_id}")'
-    lines = source.splitlines(keepends=True)
-    indent = re.match(r"\s*", lines[node.lineno - 1]).group(0)
 
     present = _polarion_ids_in(node)
     if present:
@@ -1574,7 +1563,7 @@ def add_param_polarion_id(
         return False
 
     marks_kw = _marks_keyword(node)
-    marks_src = _merged_marks(source, marks_kw, mark)
+    elements = _marks_elements(source, marks_kw, mark)
 
     if not _is_pytest_param(node):
         # A bare value or tuple: wrap it so it can carry marks.
@@ -1603,39 +1592,15 @@ def add_param_polarion_id(
                     f"marks={mark}",
                 )
         else:
-            value = marks_kw.value
-            if isinstance(value, (ast.List, ast.Tuple)) and value.elts:
-                last = value.elts[-1]
-                updated = _insert_at(
-                    source, last.end_lineno, last.end_col_offset,
-                    f", {mark}",
-                )
-            elif isinstance(value, (ast.List, ast.Tuple)):
-                updated = _splice(source, value, f"[{mark}]")
-            else:
-                # A single bare mark: promote it to a list.
-                updated = _splice(
-                    source, value, f"[{_segment(source, value)}, {mark}]"
-                )
-
-    # If that pushed a line past the formatter width, lay the whole
-    # param out over several lines instead.
-    if _too_long(updated, source):
-        updated = _splice(
-            source, node, _expand_param(source, node, marks_src, indent)
-        )
+            # Re-render the whole marks value, wrapping it over several
+            # lines if the new entry makes it too wide.
+            updated = _splice(
+                source,
+                marks_kw.value,
+                "[" + ", ".join(elements) + "]",
+            )
 
     return apply_edit(file_path, source, updated, confirm=confirm)
-
-
-def _too_long(updated: str, source: str) -> bool:
-    """Return True if the edit introduced an over-wide line."""
-    before = set(source.splitlines())
-    return any(
-        len(line) > PARAM_MAX_LINE
-        for line in updated.splitlines()
-        if line not in before
-    )
 
 
 def add_polarion_decorator(
@@ -1681,10 +1646,27 @@ def add_polarion_decorator(
     return apply_edit(file_path, source, "".join(lines))
 
 
+def _docstring_node(func: ast.AST):
+    """Return the docstring's Expr node for a function, or None."""
+    if not func.body:
+        return None
+    first = func.body[0]
+    if isinstance(first, ast.Expr) and isinstance(
+        first.value, ast.Constant
+    ) and isinstance(first.value.value, str):
+        return first
+    return None
+
+
 def ai_update_docstring(
-    file_path: Path, test_name: str, steps: list
+    file_path: Path, test_name: str, steps: list, class_name: str = None
 ) -> bool:
-    """Update the Steps section in a test function's docstring via AI."""
+    """Rewrite the Steps section of a test's docstring.
+
+    The model is asked for the docstring alone, never the whole file.
+    Its answer is spliced into the docstring's exact ast span, so no
+    edit can land outside those lines.
+    """
     if not claude_available():
         print(
             "  claude CLI not available"
@@ -1693,6 +1675,25 @@ def ai_update_docstring(
         return False
 
     source = file_path.read_text()
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        print(f"  Cannot parse {file_path.name}: {e}")
+        return False
+
+    func = find_function_node(source, test_name, class_name)
+    if func is None:
+        print(f"  Function {test_name} not found in {file_path.name}.")
+        return False
+
+    node = _docstring_node(func)
+    if node is None:
+        print(
+            f"  {test_name} has no docstring to update."
+            " Add one first, then re-run."
+        )
+        return False
+
     steps_text = "\n".join(
         f"{i}. {s['step']}"
         + (
@@ -1705,15 +1706,50 @@ def ai_update_docstring(
     prompt = DOCSTRING_PROMPT.format(
         test_name=test_name,
         steps_text=steps_text,
-        source=source,
+        docstring=_segment(source, node),
     )
     try:
-        updated = call_claude(prompt)
+        new_docstring = call_claude(prompt).strip()
     except Exception as e:
         print(f"  AI call failed: {e}")
         return False
 
-    return apply_edit(file_path, source, updated)
+    problem = _check_docstring(new_docstring)
+    if problem:
+        print(f"  Not updating the docstring: {problem}.")
+        return False
+
+    # check_size is off because the edit cannot reach past the
+    # docstring node, so a shorter docstring is a valid result.
+    return apply_edit(
+        file_path,
+        source,
+        _splice(source, node, new_docstring),
+        check_size=False,
+    )
+
+
+def _check_docstring(text: str) -> str:
+    """Return a reason the model's docstring is unusable, else ""."""
+    if not text:
+        return "the model returned nothing"
+    if text.startswith("```"):
+        return "the model wrapped it in markdown fences"
+    if not re.match(r'^[rubfRUBF]*("""|\'\'\')', text):
+        return "it does not start with a triple-quote"
+    try:
+        parsed = ast.parse(text)
+    except SyntaxError:
+        return "it is not a valid Python string literal"
+    body = parsed.body
+    if (
+        len(body) != 1
+        or not isinstance(body[0], ast.Expr)
+        or not isinstance(body[0].value, ast.Constant)
+        or not isinstance(body[0].value.value, str)
+    ):
+        return "it is not a single string literal"
+    return ""
 
 
 # ── Display helpers ──────────────────────────────────────────────────────────

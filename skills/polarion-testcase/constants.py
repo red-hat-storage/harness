@@ -19,9 +19,6 @@ CONF_FILE = os.path.expanduser("~/.polarion-testcase.conf")
 TESTLIB_MODULE = "ocs_ci.framework.testlib"
 MARKS_MODULE = "ocs_ci.framework.pytest_customization.marks"
 MAX_LINE = 79
-# Width the edited project formats to, used to decide whether a
-# polarion_id mark fits on the existing pytest.param line.
-PARAM_MAX_LINE = 88
 
 ACRONYMS = {
     "lso", "cli", "odf", "ocp", "obc", "mcg", "rgw", "mco",
@@ -99,20 +96,25 @@ Code:
 # Asking a model to echo back a whole file risks it truncating or
 # summarising the parts it was told not to change.
 
+# Only the docstring body is requested back. It is spliced into the
+# docstring's exact ast span, so the model never retypes the file and
+# cannot truncate it or drift outside the docstring.
 DOCSTRING_PROMPT = """\
-Update the docstring of the function `{test_name}` in the code below.
-Replace its `Steps:` section with the steps listed here.
-If there is no `Steps:` section, add one before the closing triple-quote.
-Do NOT change any other part of the docstring or any other part of the file.
+Rewrite the docstring below for the function `{test_name}`.
+
+Rules:
+- Replace its `Steps:` section with the steps listed here. If there is no \
+`Steps:` section, add one at the end, after any existing sections.
+- Keep the summary line and every other section exactly as they are.
+- Keep the existing indentation and the surrounding triple quotes.
+- Return ONLY the docstring, from its opening triple-quote to its closing \
+triple-quote, with no markdown fences and no explanation.
 
 New steps:
 {steps_text}
 
-Return ONLY the complete updated file content, with no markdown fences and \
-no explanation.
-
-Current file:
-{source}
+Current docstring:
+{docstring}
 """
 
 CONF_TITLE_PROMPT = """\

@@ -746,6 +746,38 @@ If the argvalues are plain tuples (not `pytest.param()`), wrap them:
 
 **Option 2 — Do nothing:** skip file edits entirely.
 
+### Step 5.1: Verify the Edit (CREATE MODE)
+
+Run this automatically after any file edit in Step 5. Do not ask the user
+anything — read the result and report one line.
+
+Re-read the changed region of the test file and confirm:
+
+1. **Placement.** Each new `polarion_id` sits on the intended target: the
+   function for a non-parametrized test, or the specific `pytest.param()`
+   entry for a param set. A per-param ID must never appear as a
+   function-level decorator, or vice versa.
+2. **Semantics.** For a parametrized test, the param set the ID landed on
+   matches the work item it was created for. Compare the param's values
+   or its `ids=` label against that work item's title. This is the one
+   check the scripts cannot make: they guarantee the ID is on param N,
+   not that param N is the scenario that work item describes.
+3. **Scope.** Nothing outside the decorator, the import, the `marks=`
+   entry, and the docstring changed.
+
+If everything matches, report a single line, for example:
+
+```
+Verified: OCS-8003 on param set 3 (AZURE-OC-1), matches the work item title.
+```
+
+If something is wrong, say so and stop — do not rewrite the file to
+"fix" it. Report which ID landed where and what you expected, and let
+the user re-run with the right `--param-index`. Guessing at the intended
+param set is exactly the failure this check exists to catch.
+
+Formatting is not your concern here: ocs-ci runs `black` in pre-commit.
+
 ### Step 4U: Run the Python Script (UPDATE MODE)
 
 Skip this step if mode is `create`.

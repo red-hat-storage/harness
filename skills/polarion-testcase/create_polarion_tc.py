@@ -894,7 +894,8 @@ def main():
         " to match Polarion steps?"
     ):
         if not ai_update_docstring(
-            test_path, args.test_name, test_steps
+            test_path, args.test_name, test_steps,
+            class_name=args.class_name,
         ):
             print("  Skipped.")
 
