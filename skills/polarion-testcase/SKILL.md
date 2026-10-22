@@ -609,10 +609,21 @@ args; otherwise use the auto-extracted text from Step 3.
   The stdin pipe remains `printf 'y\nn\nn\n'` (same as non-parametrized).
 - Neither → normal non-parametrized flow.
 
-The `y/n` answers for non-parametrized correspond to:
+The `y/n` answers correspond to the script's three prompts, in order:
 1. "Create this Polarion test case?" → `y`
-2. "Add @polarion_id(...) decorator?" → `n`  (we handle this correctly in Step 5)
+2. The polarion_id prompt → `n`
 3. "Update test docstring Steps section?" → `n`
+
+Answer `n` to 2 and 3 because Step 5 offers the user a single combined
+choice over both edits, rather than two separate yes/no questions in a
+fixed order. The script's own edits are safe to use when it is run
+directly — they are `ast`-based — but going through Step 5 keeps one
+confirmation point and one diff.
+
+Prompt 2 is worded differently depending on the mode, so match on
+position, not on text:
+- non-parametrized: `Add @polarion_id("OCS-XXXX") decorator to <file>?`
+- with `--param-index N`: `Add polarion_id("OCS-XXXX") to param set N in <file>?`
 
 Capture and display the full output.
 
@@ -748,10 +759,11 @@ If the argvalues are plain tuples (not `pytest.param()`), wrap them:
 
 ### Step 5.1: Verify the Edit (CREATE MODE)
 
-Run this automatically after any file edit in Step 5. Do not ask the user
-anything — read the result and report one line.
+Run this automatically after any file edit in Step 5 — the
+non-parametrized path, the parametrized path, and docstring edits as
+well as IDs. Do not ask the user anything; report one line.
 
-Re-read the changed region of the test file and confirm:
+Read the changed region of the test file back and confirm:
 
 1. **Placement.** Each new `polarion_id` sits on the intended target: the
    function for a non-parametrized test, or the specific `pytest.param()`

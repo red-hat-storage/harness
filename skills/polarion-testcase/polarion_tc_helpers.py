@@ -395,18 +395,7 @@ def extract_parametrize_info(
     if not fn_node:
         return None
 
-    for dec in fn_node.decorator_list:
-        if not isinstance(dec, ast.Call):
-            continue
-        func = dec.func
-        if not (
-            isinstance(func, ast.Attribute)
-            and func.attr == "parametrize"
-            and isinstance(func.value, ast.Attribute)
-            and func.value.attr == "mark"
-        ):
-            continue
-
+    for dec in _parametrize_decorators(fn_node):
         kw_map = {
             kw.arg: kw.value for kw in dec.keywords
         }
@@ -415,11 +404,7 @@ def extract_parametrize_info(
             if len(dec.args) >= 1
             else kw_map.get("argnames")
         )
-        argvalues_node = (
-            dec.args[1]
-            if len(dec.args) >= 2
-            else kw_map.get("argvalues")
-        )
+        argvalues_node = _argvalues(dec)
         if argnames_node is None or argvalues_node is None:
             continue
 
@@ -1272,15 +1257,24 @@ def apply_edit(
     return True
 
 
-def _find_function(tree: ast.AST, name: str):
-    """Return the function node called `name`, or None."""
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == name
-        ):
-            return node
-    return None
+def _load_target(file_path: Path, test_name: str, class_name: str = None):
+    """Read a file and locate a test function.
+
+    Returns (source, function node), or (None, None) after reporting
+    why the edit cannot proceed.
+    """
+    source = file_path.read_text()
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        print(f"  Cannot parse {file_path.name}: {e}")
+        return None, None
+
+    func = find_function_node(source, test_name, class_name)
+    if func is None:
+        print(f"  Function {test_name} not found in {file_path.name}.")
+        return None, None
+    return source, func
 
 
 def _decorator_name(node: ast.AST) -> str:
@@ -1475,23 +1469,14 @@ def _marks_elements(source: str, marks_kw, mark: str) -> list:
     return [_segment(source, value), mark]
 
 
-def _param_pieces(source: str, node: ast.AST) -> tuple:
-    """Return (positional, keyword) source parts, excluding marks."""
-    if _is_pytest_param(node):
-        args = [_segment(source, a) for a in node.args]
-        kws = [
-            (
-                f"{k.arg}={_segment(source, k.value)}"
-                if k.arg
-                else f"**{_segment(source, k.value)}"
-            )
-            for k in node.keywords
-            if k.arg != "marks"
-        ]
-        return args, kws
+def _bare_param_args(source: str, node: ast.AST) -> list:
+    """Return the argument parts of an argvalue given without pytest.param.
+
+    A tuple maps to several argnames, so it is unpacked.
+    """
     if isinstance(node, ast.Tuple):
-        return [_segment(source, e) for e in node.elts], []
-    return [_segment(source, node)], []
+        return [_segment(source, e) for e in node.elts]
+    return [_segment(source, node)]
 
 
 def add_param_polarion_id(
@@ -1509,16 +1494,8 @@ def add_param_polarion_id(
     tuple of marks, and a bare argvalue that is not wrapped in
     pytest.param at all.
     """
-    source = file_path.read_text()
-    try:
-        ast.parse(source)
-    except SyntaxError as e:
-        print(f"  Cannot parse {file_path.name}: {e}")
-        return False
-
-    func = find_function_node(source, test_name, class_name)
-    if func is None:
-        print(f"  Function {test_name} not found in {file_path.name}.")
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
         return False
 
     if _existing_polarion_ids(func):
@@ -1567,7 +1544,7 @@ def add_param_polarion_id(
 
     if not _is_pytest_param(node):
         # A bare value or tuple: wrap it so it can carry marks.
-        args, _ = _param_pieces(source, node)
+        args = _bare_param_args(source, node)
         updated = _splice(
             source,
             node,
@@ -1604,24 +1581,17 @@ def add_param_polarion_id(
 
 
 def add_polarion_decorator(
-    file_path: Path, test_name: str, wi_id: str
+    file_path: Path, test_name: str, wi_id: str, class_name: str = None
 ) -> bool:
     """Add @polarion_id("<wi_id>") to a test function.
 
     This is a purely mechanical edit done with ast, so the rest of the
     file is untouched by construction.
     """
-    source = file_path.read_text()
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as e:
-        print(f"  Cannot parse {file_path.name}: {e}")
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
         return False
-
-    func = _find_function(tree, test_name)
-    if func is None:
-        print(f"  Function {test_name} not found in {file_path.name}.")
-        return False
+    tree = ast.parse(source)
 
     present = _existing_polarion_ids(func)
     if wi_id in present:
@@ -1674,16 +1644,8 @@ def ai_update_docstring(
         )
         return False
 
-    source = file_path.read_text()
-    try:
-        ast.parse(source)
-    except SyntaxError as e:
-        print(f"  Cannot parse {file_path.name}: {e}")
-        return False
-
-    func = find_function_node(source, test_name, class_name)
-    if func is None:
-        print(f"  Function {test_name} not found in {file_path.name}.")
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
         return False
 
     node = _docstring_node(func)
