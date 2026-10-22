@@ -667,9 +667,13 @@ function's docstring. If the function has no docstring, create one. Format:
 ```
 
 **Option 1 or 3 — Add @polarion_id decorator:**
-Using the Edit tool:
-- Ensure `polarion_id` is in the `from ocs_ci.framework.testlib import (...)`
-  block (insert alphabetically if missing).
+Using the Edit tool. Never rewrite the whole file — make a targeted edit of
+the decorator line and the import only.
+- Ensure `polarion_id` is imported. Extend the file's existing
+  `from ocs_ci.framework.testlib import (...)` block if it has one, else its
+  `from ocs_ci.framework.pytest_customization.marks import (...)` block
+  (both re-export `polarion_id`). Only if the file has neither, add
+  `from ocs_ci.framework.pytest_customization.marks import polarion_id`.
 - For a **non-parametrized** test or `param=<N>`: place `@polarion_id("<NEW_ID>")`
   as the **last** decorator on the test method, just before `def`.
 - For a **single param set** (`param=<N>`): place the `polarion_id` inside the

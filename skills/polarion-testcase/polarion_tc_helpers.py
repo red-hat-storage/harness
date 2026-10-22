@@ -19,13 +19,15 @@ from constants import (
     ACRONYMS,
     CONF_FILE,
     CONF_TITLE_PROMPT,
-    DECORATOR_PROMPT,
     DEFAULT_EXPECTED,
     DOCSTRING_PROMPT,
     EXTRACT_PROMPT,
+    MARKS_MODULE,
+    MAX_LINE,
     POLARION_BASE,
     POLARION_REDIRECT,
     PROJECT,
+    TESTLIB_MODULE,
     TOKEN_FILE,
 )
 
@@ -1195,40 +1197,202 @@ def create_parametrized_work_items(
     return results
 
 
-# ── File editing (AI-assisted) ───────────────────────────────────────────────
+# ── File editing ─────────────────────────────────────────────────────────────
 
 
-def ai_add_polarion_decorator(
-    file_path: Path, test_name: str, wi_id: str
-) -> bool:
-    """Add @polarion_id decorator to a test function via AI."""
-    if not claude_available():
-        print(
-            "  claude CLI not available"
-            " — cannot add decorator via AI."
+def _defined_names(tree: ast.AST) -> set:
+    """Return every function and class name defined in a parsed tree."""
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
         )
-        return False
+    }
 
-    source = file_path.read_text()
-    prompt = DECORATOR_PROMPT.format(
-        wi_id=wi_id, test_name=test_name, source=source
-    )
+
+def validate_edit(source: str, updated: str) -> str:
+    """Return an error string if an edited file looks unsafe to write.
+
+    Guards against a truncated or summarised rewrite silently destroying
+    the file. Returns "" when the edit is safe.
+    """
+    if not updated.strip():
+        return "the new content is empty"
+    if updated.lstrip().startswith("```"):
+        return "the new content is wrapped in markdown fences"
     try:
-        updated = call_claude(prompt)
-    except Exception as e:
-        print(f"  AI call failed: {e}")
+        new_tree = ast.parse(updated)
+    except SyntaxError as e:
+        return f"the new content is not valid Python ({e})"
+
+    dropped = _defined_names(ast.parse(source)) - _defined_names(new_tree)
+    if dropped:
+        return (
+            "the new content is missing "
+            f"{len(dropped)} definition(s): {', '.join(sorted(dropped))}"
+        )
+    if len(updated) < len(source) * 0.9:
+        shrink = 100 - int(len(updated) / len(source) * 100)
+        return f"the new content is {shrink}% smaller than the original"
+    return ""
+
+
+def apply_edit(
+    file_path: Path, source: str, updated: str, confirm: bool = True
+) -> bool:
+    """Validate, show, confirm and write an edited file."""
+    if updated == source:
+        print("  No changes needed.")
         return False
 
-    if updated == source:
-        print("  AI returned no changes.")
+    problem = validate_edit(source, updated)
+    if problem:
+        print(f"  REFUSING to write {file_path.name}: {problem}.")
+        print("  The file has been left untouched.")
         return False
 
     show_diff(file_path.name, source, updated)
-    if not ask("Apply this change?"):
+    if confirm and not ask("Apply this change?"):
         return False
 
     file_path.write_text(updated)
     return True
+
+
+def _find_function(tree: ast.AST, name: str):
+    """Return the function node called `name`, or None."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            return node
+    return None
+
+
+def _decorator_name(node: ast.AST) -> str:
+    """Return the dotted name of a decorator expression."""
+    target = node.func if isinstance(node, ast.Call) else node
+    parts = []
+    while isinstance(target, ast.Attribute):
+        parts.append(target.attr)
+        target = target.value
+    if isinstance(target, ast.Name):
+        parts.append(target.id)
+    return ".".join(reversed(parts))
+
+
+def _existing_polarion_ids(func: ast.AST) -> list:
+    """Return the IDs of any @polarion_id decorators already present."""
+    ids = []
+    for dec in func.decorator_list:
+        if _decorator_name(dec) != "polarion_id":
+            continue
+        ids += [
+            arg.value
+            for arg in getattr(dec, "args", [])
+            if isinstance(arg, ast.Constant)
+        ]
+    return ids
+
+
+def _imports_polarion_id(tree: ast.AST) -> bool:
+    """Return True if polarion_id is already imported anywhere."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and any(a.name == "polarion_id" for a in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def _import_from(tree: ast.AST, module: str):
+    """Return the top-level `from <module> import ...` node, or None."""
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == module:
+            return node
+    return None
+
+
+def _add_to_import(lines: list, node: ast.ImportFrom) -> None:
+    """Add polarion_id to an existing import, in place."""
+    start, end = node.lineno - 1, node.end_lineno - 1
+    if end > start:
+        # Parenthesised import: add one name line before the closing ")".
+        indent = re.match(r"\s*", lines[start + 1]).group(0) or "    "
+        lines.insert(end, f"{indent}polarion_id,\n")
+        return
+
+    names = [a.name for a in node.names] + ["polarion_id"]
+    single = f"from {node.module} import {', '.join(names)}\n"
+    if len(single.rstrip("\n")) <= MAX_LINE:
+        lines[start] = single
+        return
+    # Too long for one line — switch to the parenthesised form.
+    block = [f"from {node.module} import (\n"]
+    block += [f"    {n},\n" for n in names]
+    block.append(")\n")
+    lines[start : start + 1] = block
+
+
+def _add_import(lines: list, tree: ast.AST) -> None:
+    """Make polarion_id importable, reusing the file's own convention."""
+    for module in (TESTLIB_MODULE, MARKS_MODULE):
+        node = _import_from(tree, module)
+        if node is not None:
+            _add_to_import(lines, node)
+            return
+
+    # No suitable import to extend — add one after the last top-level import.
+    last = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last = node.end_lineno
+    lines.insert(last, f"from {MARKS_MODULE} import polarion_id\n")
+
+
+def add_polarion_decorator(
+    file_path: Path, test_name: str, wi_id: str
+) -> bool:
+    """Add @polarion_id("<wi_id>") to a test function.
+
+    This is a purely mechanical edit done with ast, so the rest of the
+    file is untouched by construction.
+    """
+    source = file_path.read_text()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        print(f"  Cannot parse {file_path.name}: {e}")
+        return False
+
+    func = _find_function(tree, test_name)
+    if func is None:
+        print(f"  Function {test_name} not found in {file_path.name}.")
+        return False
+
+    present = _existing_polarion_ids(func)
+    if wi_id in present:
+        print(f'  {test_name} already has @polarion_id("{wi_id}").')
+        return False
+    if present:
+        print(
+            f"  {test_name} already has @polarion_id"
+            f"({', '.join(repr(p) for p in present)})"
+            " — leaving it alone."
+        )
+        return False
+
+    lines = source.splitlines(keepends=True)
+    # Insert the decorator first: it sits below the imports, so the
+    # import line numbers stay valid for the second edit.
+    indent = re.match(r"\s*", lines[func.lineno - 1]).group(0)
+    lines.insert(func.lineno - 1, f'{indent}@polarion_id("{wi_id}")\n')
+    if not _imports_polarion_id(tree):
+        _add_import(lines, tree)
+
+    return apply_edit(file_path, source, "".join(lines))
 
 
 def ai_update_docstring(
@@ -1263,16 +1427,7 @@ def ai_update_docstring(
         print(f"  AI call failed: {e}")
         return False
 
-    if updated == source:
-        print("  AI returned no changes.")
-        return False
-
-    show_diff(file_path.name, source, updated)
-    if not ask("Apply this change?"):
-        return False
-
-    file_path.write_text(updated)
-    return True
+    return apply_edit(file_path, source, updated)
 
 
 # ── Display helpers ──────────────────────────────────────────────────────────

@@ -47,7 +47,7 @@ from constants import (
     VALID_CASEIMPORTANCE,
 )
 from polarion_tc_helpers import (
-    ai_add_polarion_decorator,
+    add_polarion_decorator,
     ai_update_docstring,
     ask,
     auto_extract_steps,
@@ -851,7 +851,7 @@ def main():
         f'Add @polarion_id("{wi_id}") decorator'
         f" to {test_path.name}?"
     ):
-        if not ai_add_polarion_decorator(
+        if not add_polarion_decorator(
             test_path, args.test_name, wi_id
         ):
             print(

@@ -14,6 +14,12 @@ POLARION_REDIRECT = f"{_polarion_root}/redirect"
 TOKEN_FILE = os.path.expanduser("~/.polarion-token")
 CONF_FILE = os.path.expanduser("~/.polarion-testcase.conf")
 
+# Modules that re-export the polarion_id mark, preferred in this order
+# when making it importable in a test file.
+TESTLIB_MODULE = "ocs_ci.framework.testlib"
+MARKS_MODULE = "ocs_ci.framework.pytest_customization.marks"
+MAX_LINE = 79
+
 ACRONYMS = {
     "lso", "cli", "odf", "ocp", "obc", "mcg", "rgw", "mco",
     "ui", "api", "s3", "ocs", "kms", "aws", "gcp", "ibm",
@@ -85,22 +91,10 @@ Code:
 ```
 """
 
-DECORATOR_PROMPT = """\
-Add the decorator `@polarion_id("{wi_id}")` to the Python function \
-`{test_name}` in the code below.
-
-Rules:
-- Place `@polarion_id("{wi_id}")` immediately above the `def {test_name}` \
-line, after any existing decorators on that function.
-- If `from ocs_ci.framework.testlib import` is present and does not already \
-contain `polarion_id`, add `polarion_id` to that import alphabetically.
-- Do NOT change anything else in the file.
-- Return ONLY the complete updated file content, with no markdown fences and \
-no explanation.
-
-Current file:
-{source}
-"""
+# Note: adding the @polarion_id decorator is done with ast in
+# polarion_tc_helpers.add_polarion_decorator, not by an LLM rewrite.
+# Asking a model to echo back a whole file risks it truncating or
+# summarising the parts it was told not to change.
 
 DOCSTRING_PROMPT = """\
 Update the docstring of the function `{test_name}` in the code below.
