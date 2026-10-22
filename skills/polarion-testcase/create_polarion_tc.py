@@ -47,6 +47,7 @@ from constants import (
     VALID_CASEIMPORTANCE,
 )
 from polarion_tc_helpers import (
+    add_param_polarion_id,
     add_polarion_decorator,
     ai_update_docstring,
     ask,
@@ -845,20 +846,47 @@ def main():
                     f" | Expected: {s['expected']}"
             )
 
-    # 11. Add @polarion decorator (AI-assisted)
+    # 11. Add the polarion_id to the test file
     print()
-    if ask(
-        f'Add @polarion_id("{wi_id}") decorator'
-        f" to {test_path.name}?"
-    ):
-        if not add_polarion_decorator(
-            test_path, args.test_name, wi_id
-        ):
-            print(
+    single_param = (
+        param_info is not None and args.param_index is not None
+    )
+    if single_param:
+        # The ID belongs to one param set, not the whole function.
+        prompt = (
+            f'Add polarion_id("{wi_id}") to param set'
+            f" {args.param_index} in {test_path.name}?"
+        )
+    else:
+        prompt = (
+            f'Add @polarion_id("{wi_id}") decorator'
+            f" to {test_path.name}?"
+        )
+
+    if ask(prompt):
+        if single_param:
+            done = add_param_polarion_id(
+                test_path,
+                args.test_name,
+                args.param_index,
+                wi_id,
+                class_name=args.class_name,
+            )
+            hint = (
+                f"  Add manually to param set {args.param_index}:\n"
+                f'  marks=pytest.mark.polarion_id("{wi_id}")'
+            )
+        else:
+            done = add_polarion_decorator(
+                test_path, args.test_name, wi_id
+            )
+            hint = (
                 f"  Add manually:\n"
                 f'  @polarion_id("{wi_id}")\n'
                 f"  def {args.test_name}(..."
             )
+        if not done:
+            print(hint)
 
     # 12. Update docstring Steps section (AI-assisted)
     if test_steps and ask(

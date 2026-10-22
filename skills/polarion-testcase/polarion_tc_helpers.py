@@ -24,6 +24,7 @@ from constants import (
     EXTRACT_PROMPT,
     MARKS_MODULE,
     MAX_LINE,
+    PARAM_MAX_LINE,
     POLARION_BASE,
     POLARION_REDIRECT,
     PROJECT,
@@ -1224,6 +1225,9 @@ def validate_edit(source: str, updated: str) -> str:
         return "the new content is wrapped in markdown fences"
     try:
         new_tree = ast.parse(updated)
+        # ast.parse alone accepts things the compiler rejects, such as
+        # a repeated keyword argument, so compile it too.
+        compile(updated, "<edit>", "exec")
     except SyntaxError as e:
         return f"the new content is not valid Python ({e})"
 
@@ -1285,10 +1289,15 @@ def _decorator_name(node: ast.AST) -> str:
 
 
 def _existing_polarion_ids(func: ast.AST) -> list:
-    """Return the IDs of any @polarion_id decorators already present."""
+    """Return the IDs of any polarion_id decorators already present.
+
+    Matches on the last dotted segment so that both the bare
+    `@polarion_id(...)` and the `@pytest.mark.polarion_id(...)` form
+    are recognised.
+    """
     ids = []
     for dec in func.decorator_list:
-        if _decorator_name(dec) != "polarion_id":
+        if _decorator_name(dec).split(".")[-1] != "polarion_id":
             continue
         ids += [
             arg.value
@@ -1350,6 +1359,283 @@ def _add_import(lines: list, tree: ast.AST) -> None:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             last = node.end_lineno
     lines.insert(last, f"from {MARKS_MODULE} import polarion_id\n")
+
+
+def _splice(source: str, node: ast.AST, new_text: str) -> str:
+    """Replace a node's exact source span with new_text.
+
+    col_offset values from ast are utf-8 byte offsets, so the start and
+    end lines are sliced as bytes to stay correct on non-ASCII lines.
+    """
+    lines = source.splitlines(keepends=True)
+    head = lines[node.lineno - 1].encode()[: node.col_offset].decode()
+    tail = lines[node.end_lineno - 1].encode()[node.end_col_offset :].decode()
+    return "".join(
+        lines[: node.lineno - 1]
+        + [head + new_text + tail]
+        + lines[node.end_lineno :]
+    )
+
+
+def _insert_at(source: str, lineno: int, col: int, text: str) -> str:
+    """Insert text at a (1-based line, utf-8 column) position."""
+    lines = source.splitlines(keepends=True)
+    raw = lines[lineno - 1].encode()
+    lines[lineno - 1] = (raw[:col].decode() + text + raw[col:].decode())
+    return "".join(lines)
+
+
+def _segment(source: str, node: ast.AST) -> str:
+    """Return the original source text of a node."""
+    return ast.get_source_segment(source, node) or ""
+
+
+def _parametrize_decorators(func: ast.AST) -> list:
+    """Return the @pytest.mark.parametrize decorators on a function."""
+    found = []
+    for dec in func.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        f = dec.func
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "parametrize"
+            and isinstance(f.value, ast.Attribute)
+            and f.value.attr == "mark"
+            and isinstance(f.value.value, ast.Name)
+            and f.value.value.id == "pytest"
+        ):
+            found.append(dec)
+    return found
+
+
+def _argvalues(dec: ast.Call):
+    """Return the argvalues node of a parametrize decorator, or None."""
+    kw = {k.arg: k.value for k in dec.keywords}
+    if len(dec.args) >= 2:
+        return dec.args[1]
+    return kw.get("argvalues")
+
+
+def _is_pytest_param(node: ast.AST) -> bool:
+    """Return True if node is a pytest.param(...) call."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "param"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pytest"
+    )
+
+
+def _marks_keyword(node: ast.AST):
+    """Return the marks= keyword node of a pytest.param call, or None."""
+    if not isinstance(node, ast.Call):
+        return None
+    for kw in node.keywords:
+        if kw.arg == "marks":
+            return kw
+    return None
+
+
+def _polarion_ids_in(node: ast.AST) -> list:
+    """Return IDs of any polarion_id marks inside an expression."""
+    ids = []
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        name = (
+            func.attr
+            if isinstance(func, ast.Attribute)
+            else getattr(func, "id", "")
+        )
+        if name != "polarion_id":
+            continue
+        ids += [
+            a.value for a in sub.args if isinstance(a, ast.Constant)
+        ]
+    return ids
+
+
+def _merged_marks(source: str, marks_kw, mark: str) -> str:
+    """Return the marks= source with the new mark folded in."""
+    if marks_kw is None:
+        return mark
+    value = marks_kw.value
+    if isinstance(value, (ast.List, ast.Tuple)):
+        elts = [_segment(source, e) for e in value.elts]
+        return "[" + ", ".join(elts + [mark]) + "]"
+    return f"[{_segment(source, value)}, {mark}]"
+
+
+def _param_pieces(source: str, node: ast.AST) -> tuple:
+    """Return (positional, keyword) source parts, excluding marks."""
+    if _is_pytest_param(node):
+        args = [_segment(source, a) for a in node.args]
+        kws = [
+            (
+                f"{k.arg}={_segment(source, k.value)}"
+                if k.arg
+                else f"**{_segment(source, k.value)}"
+            )
+            for k in node.keywords
+            if k.arg != "marks"
+        ]
+        return args, kws
+    if isinstance(node, ast.Tuple):
+        return [_segment(source, e) for e in node.elts], []
+    return [_segment(source, node)], []
+
+
+def _expand_param(
+    source: str, node: ast.AST, marks_src: str, indent: str
+) -> str:
+    """Rebuild a param across several lines, carrying marks_src.
+
+    The existing marks= is folded into marks_src by the caller, so it
+    is dropped here rather than emitted a second time.
+    """
+    inner = indent + "    "
+    args, kws = _param_pieces(source, node)
+    parts = args + kws + [f"marks={marks_src}"]
+    body = "".join(f"{inner}{p},\n" for p in parts)
+    return f"pytest.param(\n{body}{indent})"
+
+
+def add_param_polarion_id(
+    file_path: Path,
+    test_name: str,
+    param_index: int,
+    wi_id: str,
+    class_name: str = None,
+    confirm: bool = True,
+) -> bool:
+    """Add a polarion_id mark to one pytest.param of a parametrized test.
+
+    Done with ast, so only the targeted param set is rewritten. Handles
+    a param with no marks, an existing single mark, an existing list or
+    tuple of marks, and a bare argvalue that is not wrapped in
+    pytest.param at all.
+    """
+    source = file_path.read_text()
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        print(f"  Cannot parse {file_path.name}: {e}")
+        return False
+
+    func = find_function_node(source, test_name, class_name)
+    if func is None:
+        print(f"  Function {test_name} not found in {file_path.name}.")
+        return False
+
+    if _existing_polarion_ids(func):
+        print(
+            f"  {test_name} already carries a function-level"
+            " @polarion_id — refusing to also set a per-param ID."
+        )
+        return False
+
+    decs = _parametrize_decorators(func)
+    if not decs:
+        print(f"  {test_name} is not parametrized with pytest.mark.parametrize.")
+        return False
+    if len(decs) > 1:
+        print(
+            f"  {test_name} has {len(decs)} parametrize decorators —"
+            " a single param index is ambiguous. Edit it by hand."
+        )
+        return False
+
+    argvalues = _argvalues(decs[0])
+    if not isinstance(argvalues, (ast.List, ast.Tuple)):
+        print("  argvalues is not a literal list — cannot index it.")
+        return False
+    if not 0 <= param_index < len(argvalues.elts):
+        print(
+            f"  param index {param_index} out of range"
+            f" (0..{len(argvalues.elts) - 1})."
+        )
+        return False
+
+    node = argvalues.elts[param_index]
+    mark = f'pytest.mark.polarion_id("{wi_id}")'
+    lines = source.splitlines(keepends=True)
+    indent = re.match(r"\s*", lines[node.lineno - 1]).group(0)
+
+    present = _polarion_ids_in(node)
+    if present:
+        print(
+            f"  param {param_index} already has polarion_id"
+            f"({', '.join(repr(p) for p in present)})"
+            " — leaving it alone."
+        )
+        return False
+
+    marks_kw = _marks_keyword(node)
+    marks_src = _merged_marks(source, marks_kw, mark)
+
+    if not _is_pytest_param(node):
+        # A bare value or tuple: wrap it so it can carry marks.
+        args, _ = _param_pieces(source, node)
+        updated = _splice(
+            source,
+            node,
+            f"pytest.param({', '.join(args)}, marks={mark})",
+        )
+    else:
+        if marks_kw is None:
+            # Insert just after the last argument, which keeps any
+            # trailing comma and the existing layout intact.
+            tail = (node.args + [k.value for k in node.keywords]) or None
+            if tail:
+                last = max(
+                    tail, key=lambda n: (n.end_lineno, n.end_col_offset)
+                )
+                updated = _insert_at(
+                    source, last.end_lineno, last.end_col_offset,
+                    f", marks={mark}",
+                )
+            else:
+                updated = _insert_at(
+                    source, node.end_lineno, node.end_col_offset - 1,
+                    f"marks={mark}",
+                )
+        else:
+            value = marks_kw.value
+            if isinstance(value, (ast.List, ast.Tuple)) and value.elts:
+                last = value.elts[-1]
+                updated = _insert_at(
+                    source, last.end_lineno, last.end_col_offset,
+                    f", {mark}",
+                )
+            elif isinstance(value, (ast.List, ast.Tuple)):
+                updated = _splice(source, value, f"[{mark}]")
+            else:
+                # A single bare mark: promote it to a list.
+                updated = _splice(
+                    source, value, f"[{_segment(source, value)}, {mark}]"
+                )
+
+    # If that pushed a line past the formatter width, lay the whole
+    # param out over several lines instead.
+    if _too_long(updated, source):
+        updated = _splice(
+            source, node, _expand_param(source, node, marks_src, indent)
+        )
+
+    return apply_edit(file_path, source, updated, confirm=confirm)
+
+
+def _too_long(updated: str, source: str) -> bool:
+    """Return True if the edit introduced an over-wide line."""
+    before = set(source.splitlines())
+    return any(
+        len(line) > PARAM_MAX_LINE
+        for line in updated.splitlines()
+        if line not in before
+    )
 
 
 def add_polarion_decorator(

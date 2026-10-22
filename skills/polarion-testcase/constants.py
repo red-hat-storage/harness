@@ -19,6 +19,9 @@ CONF_FILE = os.path.expanduser("~/.polarion-testcase.conf")
 TESTLIB_MODULE = "ocs_ci.framework.testlib"
 MARKS_MODULE = "ocs_ci.framework.pytest_customization.marks"
 MAX_LINE = 79
+# Width the edited project formats to, used to decide whether a
+# polarion_id mark fits on the existing pytest.param line.
+PARAM_MAX_LINE = 88
 
 ACRONYMS = {
     "lso", "cli", "odf", "ocp", "obc", "mcg", "rgw", "mco",
