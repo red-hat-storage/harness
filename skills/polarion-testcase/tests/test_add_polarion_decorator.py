@@ -109,6 +109,23 @@ def check(label, condition, detail=""):
         raise AssertionError(f"{label}{': ' + detail if detail else ''}")
 
 
+def _skip(name, reason):
+    """Record and report a skip when an upstream fixture is absent.
+
+    Under pytest a bare return counts as a pass, which is the exact
+    "absent fixture reads as success" failure this guards against, so
+    hand the skip to pytest when pytest is the one running. Looked up
+    in sys.modules rather than imported, to keep this file runnable
+    without pytest installed.
+    """
+    SKIPPED.append(name)
+    print(f"SKIP: {name} — {reason}")
+    pytest = sys.modules.get("pytest")
+    if pytest is not None:
+        pytest.skip(reason)
+    return None
+
+
 def assert_untouched(label, before, after, returned, output, expect):
     """Assert the call refused and left the file byte-identical."""
     check(f"{label}: should return False", returned is False)
@@ -126,17 +143,15 @@ def assert_untouched(label, before, after, returned, output, expect):
 def test_real_ocs_ci_module():
     """The real module gets a 2-line diff and nothing else."""
     if REAL_FILE is None or not REAL_FILE.exists():
-        SKIPPED.append("real_ocs_ci_module")
-        print("SKIP: real_ocs_ci_module — no project dir configured")
-        return
+        return _skip("real_ocs_ci_module", "no project dir configured")
 
     before = REAL_FILE.read_text()
     if "polarion_id" in before:
         # Upstream added one since this test was written; the fixture,
         # not the code, is what broke.
-        SKIPPED.append("real_ocs_ci_module")
-        print(f"SKIP: real_ocs_ci_module — {REAL_FILE.name} now has an ID")
-        return
+        return _skip(
+            "real_ocs_ci_module", f"{REAL_FILE.name} now has an ID"
+        )
     returned, after, out = run_add("real", before, REAL_NAME, "OCS-8365")
 
     check("real: should return True", returned is True, out.strip()[:120])

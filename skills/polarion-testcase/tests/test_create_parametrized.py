@@ -90,12 +90,22 @@ FAKE_RELATED = "OCS-2255"
 
 
 def _skip(name, file_path):
-    """Record and report a skip when an upstream fixture is absent."""
+    """Record and report a skip when an upstream fixture is absent.
+
+    Under pytest a bare return counts as a pass, which is the exact
+    "absent fixture reads as success" failure this guards against, so
+    hand the skip to pytest when pytest is the one running. Looked up
+    in sys.modules rather than imported, to keep this file runnable
+    without pytest installed.
+    """
     SKIPPED.append(name)
     missing = "no project dir configured" if file_path is None else (
         f"{file_path.name} not present"
     )
     print(f"SKIP: {name} — {missing}")
+    pytest = sys.modules.get("pytest")
+    if pytest is not None:
+        pytest.skip(missing)
     return None
 
 

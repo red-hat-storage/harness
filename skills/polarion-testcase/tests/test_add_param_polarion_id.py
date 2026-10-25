@@ -89,6 +89,23 @@ def check(label, condition, detail=""):
         raise AssertionError(f"{label}{': ' + detail if detail else ''}")
 
 
+def _skip(name, reason):
+    """Record and report a skip when an upstream fixture is absent.
+
+    Under pytest a bare return counts as a pass, which is the exact
+    "absent fixture reads as success" failure this guards against, so
+    hand the skip to pytest when pytest is the one running. Looked up
+    in sys.modules rather than imported, to keep this file runnable
+    without pytest installed.
+    """
+    SKIPPED.append(name)
+    print(f"SKIP: {name} — {reason}")
+    pytest = sys.modules.get("pytest")
+    if pytest is not None:
+        pytest.skip(reason)
+    return None
+
+
 def marks_of(text, test_name, index):
     """Return the source of the marks= on one param, or ''."""
     tree = ast.parse(text)
@@ -151,9 +168,7 @@ def body(params, argnames='argnames=["platform"],', extra=""):
 def test_real_ocs_ci_file():
     """Splat argvalues with no marks, in a real OCS-CI module."""
     if REAL_FILE is None or not REAL_FILE.exists():
-        SKIPPED.append("real_ocs_ci_file")
-        print("SKIP: real_ocs_ci_file — no project dir configured")
-        return
+        return _skip("real_ocs_ci_file", "no project dir configured")
     before = REAL_FILE.read_text()
     first, after, out1 = run_add("real0", before, REAL_NAME, 0, "OCS-9001")
     check("real: first param marked", first is True, out1.strip()[:80])
