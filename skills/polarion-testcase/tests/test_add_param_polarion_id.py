@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temp test for add_param_polarion_id.
+Tests for add_param_polarion_id.
 
 Per-param-set IDs go inside `pytest.param(..., marks=...)`, not on the
 function. This covers the argvalue shapes that occur in OCS-CI.
@@ -18,6 +18,7 @@ Tests covered:
 - keyword argvalues=                          — found via keyword
 - two classes defining the same test name     — class_name disambiguates
 - a long line                                 — left for black to wrap
+- non-ASCII on the edited line                — utf-8 column offsets hold
 - six param sets marked one at a time         — each keeps its own ID
 - param already holding a polarion_id         — refused
 - function-level @polarion_id present         — refused
@@ -30,8 +31,10 @@ Usage:
 """
 
 import ast
+import atexit
 import contextlib
 import io
+import os
 import shutil
 import sys
 import tempfile
@@ -39,13 +42,26 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from polarion_tc_helpers import add_param_polarion_id  # noqa: E402
+from polarion_tc_helpers import (  # noqa: E402
+    add_param_polarion_id,
+    get_project_dir,
+)
 
-OCS_CI = Path("/home/ikave/IBMProjects/ocs-ci")
-REAL_FILE = OCS_CI / "tests" / "libtest" / "test_sanity_provider_mode.py"
+# The project under test is configured, not hardcoded — same source the
+# skill itself uses. Tests needing a real file skip loudly without it.
+PROJECT_DIR = os.environ.get("POLARION_PROJECT_DIR") or get_project_dir()
+REAL_FILE = (
+    Path(PROJECT_DIR) / "tests" / "libtest" / "test_sanity_provider_mode.py"
+    if PROJECT_DIR
+    else None
+)
 REAL_NAME = "test_sanity_ms"
 
+SKIPPED = []
+
 TMP = Path(tempfile.mkdtemp(prefix="polarion_param_test_"))
+# Also runs under pytest, where the __main__ block below never fires.
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 HEAD = "import pytest\n\n\n"
 
@@ -134,17 +150,15 @@ def body(params, argnames='argnames=["platform"],', extra=""):
 
 def test_real_ocs_ci_file():
     """Splat argvalues with no marks, in a real OCS-CI module."""
-    if not REAL_FILE.exists():
-        print(f"SKIP: {REAL_FILE.name} not present")
+    if REAL_FILE is None or not REAL_FILE.exists():
+        SKIPPED.append("real_ocs_ci_file")
+        print("SKIP: real_ocs_ci_file — no project dir configured")
         return
     before = REAL_FILE.read_text()
-    _, after, _ = run_add("real0", before, REAL_NAME, 0, "OCS-9001")
-    path = TMP / "real0.py"
-    path.write_text(after)
-    sys.stdin = io.StringIO("y\n")
-    with contextlib.redirect_stdout(io.StringIO()):
-        add_param_polarion_id(path, REAL_NAME, 1, "OCS-9002")
-    final = path.read_text()
+    first, after, out1 = run_add("real0", before, REAL_NAME, 0, "OCS-9001")
+    check("real: first param marked", first is True, out1.strip()[:80])
+    second, final, out2 = run_add("real0", after, REAL_NAME, 1, "OCS-9002")
+    check("real: second param marked", second is True, out2.strip()[:80])
 
     assert_good("real", before, final, REAL_NAME, 0, "OCS-9001")
     assert_good("real", before, final, REAL_NAME, 1, "OCS-9002")
@@ -322,6 +336,37 @@ def test_long_line_left_for_black():
     print("PASS: long_line_left_for_black")
 
 
+def test_non_ascii_line_keeps_its_text():
+    """Columns are utf-8 byte offsets, so the edit must slice as bytes.
+
+    Both edit paths are exercised: the insert used when there are no
+    marks yet, and the splice used when there are. With character
+    slicing the mark lands mid-token and the trailing comment is eaten.
+    """
+    value = '"café-ü-日本"'
+    for label, param, index in (
+        ("insert", f"pytest.param({value}),  # naïve", 0),
+        ("splice", f"pytest.param({value}, marks=pytest.mark.tier1),", 0),
+    ):
+        src = body(f"        {param}\n")
+        returned, after, out = run_add(
+            f"utf8-{label}", src, "test_a", index, "OCS-30"
+        )
+        check(f"utf8 {label}: returns True", returned is True, out.strip())
+        assert_good(f"utf8 {label}", src, after, "test_a", index, "OCS-30")
+        check(
+            f"utf8 {label}: the value survived intact",
+            value in after,
+            after,
+        )
+    check(
+        "utf8 insert: the trailing comment survived",
+        "# naïve" in (TMP / "utf8-insert.py").read_text(),
+        (TMP / "utf8-insert.py").read_text(),
+    )
+    print("PASS: non_ascii_line_keeps_its_text")
+
+
 def test_many_params_sequentially():
     """Six param sets each get their own ID, one call at a time."""
     src = body(
@@ -332,23 +377,21 @@ def test_many_params_sequentially():
     )
     text = src
     for i in range(6):
-        path = TMP / "many.py"
-        path.write_text(text)
-        sys.stdin = io.StringIO("y\n")
-        with contextlib.redirect_stdout(io.StringIO()) as buf:
-            ok = add_param_polarion_id(path, "test_a", i, f"OCS-70{i}")
+        ok, text, out = run_add("many", text, "test_a", i, f"OCS-70{i}")
         check(
             f"many: param {i} must be marked",
             ok is True,
-            buf.getvalue().strip()[:70],
+            out.strip()[:70],
         )
-        text = path.read_text()
 
     for i in range(6):
         assert_good("many", src, text, "test_a", i, f"OCS-70{i}")
     check(
         "many: original marks all kept",
-        all(f"tier{i % 2 + 1}" in marks_of(text, "test_a", i) for i in range(6)),
+        all(
+            f"tier{i % 2 + 1}" in marks_of(text, "test_a", i)
+            for i in range(6)
+        ),
         text,
     )
     check(
@@ -426,7 +469,14 @@ def test_second_param_targeted():
 
 
 def test_class_scoped_lookup():
-    """class_name disambiguates same-named tests."""
+    """A parametrized method inside a class, indented two levels.
+
+    This does not prove class_name is honoured — test_a is unique
+    here, so the lookup finds it either way. See
+    test_class_name_picks_the_right_duplicate for that. What it adds
+    is the deepest indentation in the file, where the column
+    arithmetic has the most room to be wrong.
+    """
     src = (
         HEAD
         + "class TestOne:\n"
@@ -567,6 +617,7 @@ if __name__ == "__main__":
         test_bare_tuple_unpacked,
         test_positional_argvalues,
         test_long_line_left_for_black,
+        test_non_ascii_line_keeps_its_text,
         test_many_params_sequentially,
         test_second_param_targeted,
         test_class_scoped_lookup,
@@ -582,10 +633,20 @@ if __name__ == "__main__":
         test_declined_at_prompt,
     ]
 
-    try:
-        for t in tests:
+    failed = []
+    for t in tests:
+        try:
             t()
-            print()
-        print(f"All {len(tests)} tests passed.")
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print(f"FAIL: {t.__name__}\n  {e}")
+        print()
+
+    if failed:
+        print(f"{len(failed)} of {len(tests)} tests failed:")
+        print(f"  {', '.join(failed)}")
+        sys.exit(1)
+    passed = len(tests) - len(SKIPPED)
+    print(f"All {passed} tests passed.")
+    if SKIPPED:
+        print(f"{len(SKIPPED)} skipped: {', '.join(SKIPPED)}")

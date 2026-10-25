@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Temp test for add_polarion_decorator and the validate_edit write guard.
+Tests for add_polarion_decorator and the validate_edit write guard.
 
 Covers the bug where the decorator was added by asking an LLM to echo
 back the whole file: on a large module the reply was truncated and the
 file was overwritten with a fragment of itself.
 
 Tests covered:
-- real OCS-CI module (414 lines)      — decorator added, nothing else changed
+- a real OCS-CI module                — decorator added, nothing else changed
 - parenthesised marks import          — one name line inserted
 - single-line testlib import          — rebuilt on one line
 - single-line import that grows long  — converted to parenthesised form
@@ -21,15 +21,18 @@ Tests covered:
 - @pytest.mark.polarion_id form       — recognised, refuses
 - function not in file                — refuses, file untouched
 - unparseable file                    — refuses, file untouched
-- validate_edit against 9 bad rewrites, including the real truncation
+- validate_edit against 9 bad rewrites of a synthetic module
 
 Usage:
     python tests/test_add_polarion_decorator.py
 """
 
 import ast
+import atexit
 import contextlib
+import difflib
 import io
+import os
 import shutil
 import sys
 import tempfile
@@ -40,22 +43,30 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from constants import MARKS_MODULE, TESTLIB_MODULE  # noqa: E402
 from polarion_tc_helpers import (  # noqa: E402
     add_polarion_decorator,
+    get_project_dir,
     validate_edit,
 )
 
-OCS_CI = Path("/home/ikave/IBMProjects/ocs-ci")
-
+# The project under test is configured, not hardcoded — same source the
+# skill itself uses. Tests needing a real file skip loudly without it.
+PROJECT_DIR = os.environ.get("POLARION_PROJECT_DIR") or get_project_dir()
 REAL_FILE = (
-    OCS_CI
+    Path(PROJECT_DIR)
     / "tests"
     / "functional"
     / "object"
     / "mcg"
     / "test_noobaa_db_tls.py"
+    if PROJECT_DIR
+    else None
 )
 REAL_NAME = "test_noobaa_db_tls_after_upgrade"
 
+SKIPPED = []
+
 TMP = Path(tempfile.mkdtemp(prefix="polarion_decorator_test_"))
+# Also runs under pytest, where the __main__ block below never fires.
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 
 # ── harness ──────────────────────────────────────────────────────────
@@ -81,8 +92,6 @@ def run_add(name, source, test_name, wi_id, answer="y"):
 
 def changed_lines(before, after):
     """Return (added, removed) line lists between two file texts."""
-    import difflib
-
     added, removed = [], []
     for line in difflib.unified_diff(
         before.splitlines(), after.splitlines(), n=0
@@ -115,15 +124,22 @@ def assert_untouched(label, before, after, returned, output, expect):
 
 
 def test_real_ocs_ci_module():
-    """The 414-line module gets a 2-line diff and nothing else."""
-    if not REAL_FILE.exists():
-        print(f"SKIP: {REAL_FILE.name} not on this branch")
+    """The real module gets a 2-line diff and nothing else."""
+    if REAL_FILE is None or not REAL_FILE.exists():
+        SKIPPED.append("real_ocs_ci_module")
+        print("SKIP: real_ocs_ci_module — no project dir configured")
         return
 
     before = REAL_FILE.read_text()
-    returned, after, _ = run_add("real", before, REAL_NAME, "OCS-8365")
+    if "polarion_id" in before:
+        # Upstream added one since this test was written; the fixture,
+        # not the code, is what broke.
+        SKIPPED.append("real_ocs_ci_module")
+        print(f"SKIP: real_ocs_ci_module — {REAL_FILE.name} now has an ID")
+        return
+    returned, after, out = run_add("real", before, REAL_NAME, "OCS-8365")
 
-    check("real: should return True", returned is True)
+    check("real: should return True", returned is True, out.strip()[:120])
     added, removed = changed_lines(before, after)
     check(
         "real: exactly 2 lines added",
@@ -394,9 +410,10 @@ async def test_a():
 
 def test_module_level_function():
     """A test outside a class gets the decorator at column 0."""
-    _, after, _ = run_add(
+    returned, after, out = run_add(
         "modlevel", MODULE_LEVEL, "test_a", "OCS-105"
     )
+    check("modlevel: returns True", returned is True, out.strip()[:120])
     check(
         "modlevel: decorator unindented",
         '\n@polarion_id("OCS-105")\ndef test_a():' in after,
@@ -538,13 +555,21 @@ def test_declined_at_prompt():
 # ── the write guard ──────────────────────────────────────────────────
 
 
+# validate_edit is pure, so the guard is checked against a synthetic
+# module rather than a real file. The earlier fallback repeated one
+# snippet 40 times, which made "truncated tail" pass the guard
+# legitimately — every definition still existed in another copy and the
+# file barely shrank — so the case quietly tested nothing wherever the
+# real file was absent. Distinct definitions, one per line, make each
+# truncation a genuine loss.
+GUARD_SOURCE = "".join(
+    f"def fn_{i:03d}():\n    return {i}\n\n\n" for i in range(60)
+)
+
+
 def test_validate_edit_blocks_bad_rewrites():
     """Every destructive rewrite is rejected, the good one allowed."""
-    source = (
-        REAL_FILE.read_text()
-        if REAL_FILE.exists()
-        else ALREADY_IMPORTED * 40
-    )
+    source = GUARD_SOURCE
     lines = source.splitlines(keepends=True)
     cut = len(lines) // 2
 
@@ -653,10 +678,20 @@ if __name__ == "__main__":
         test_validate_edit_blocks_bad_rewrites,
     ]
 
-    try:
-        for t in tests:
+    failed = []
+    for t in tests:
+        try:
             t()
-            print()
-        print(f"All {len(tests)} tests passed.")
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print(f"FAIL: {t.__name__}\n  {e}")
+        print()
+
+    if failed:
+        print(f"{len(failed)} of {len(tests)} tests failed:")
+        print(f"  {', '.join(failed)}")
+        sys.exit(1)
+    passed = len(tests) - len(SKIPPED)
+    print(f"All {passed} tests passed.")
+    if SKIPPED:
+        print(f"{len(SKIPPED)} skipped: {', '.join(SKIPPED)}")

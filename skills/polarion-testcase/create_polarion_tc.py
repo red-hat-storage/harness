@@ -39,8 +39,6 @@ import sys
 from pathlib import Path
 
 from constants import (
-    POLARION_REDIRECT,
-    PROJECT,
     STEPS_FILE_EXAMPLE,
     TXT_STEPS_EXAMPLE,
     VALID_CASEAUTOMATION,
@@ -84,7 +82,7 @@ def conf_main(args, test_path: Path) -> None:
     """Create a description-only Polarion test case from a conf file."""
     print(f"Conf file mode: {test_path.name}")
     if claude_available():
-        print(f"Claude CLI available (AI features enabled)")
+        print("Claude CLI available (AI features enabled)")
     else:
         print("Claude CLI: not found (AI features disabled)")
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temp test for ai_update_docstring.
+Tests for ai_update_docstring.
 
 The model is asked for the docstring alone and its answer is spliced
 into the docstring's ast span, so it can neither truncate the file nor
@@ -20,12 +20,16 @@ Tests covered:
 - a reply that deletes code   — cannot reach outside the docstring span
 - no docstring on the function— refused with a clear message
 - missing function            — refused
+- no claude CLI               — refused before the file is read
+- the CLI raising             — reported, not propagated
+- an unchanged docstring      — no-op, reported as such
 - answering n at the prompt   — file untouched
 
 Usage:
     python tests/test_update_docstring.py
 """
 
+import atexit
 import contextlib
 import io
 import shutil
@@ -38,6 +42,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import polarion_tc_helpers as H  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp(prefix="polarion_docstring_test_"))
+# Also runs under pytest, where the __main__ block below never fires.
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 SOURCE = '''\
 import logging
@@ -73,6 +79,15 @@ GOOD = '''"""Check the thing works.
         3. Verify the checksum.
         """'''
 
+# The docstring test_a already has, so the model "changing" nothing
+# can be told apart from the model being refused.
+SAME = '''"""Check the thing works.
+
+        Steps:
+        1. Old step one.
+        2. Old step two.
+        """'''
+
 STEPS = [
     {"step": "Create the bucket.", "expected": "Step completes successfully."},
     {"step": "Upload an object.", "expected": "Step completes successfully."},
@@ -86,37 +101,56 @@ def check(label, condition, detail=""):
         raise AssertionError(f"{label}{': ' + detail if detail else ''}")
 
 
-def run(name, reply, answer="y", source=SOURCE, test_name="test_a"):
-    """Run ai_update_docstring with call_claude stubbed."""
-    path = TMP / f"{name}.py"
-    path.write_text(source)
+@contextlib.contextmanager
+def stubbed(reply, answer="y", available=True):
+    """Stand in for the claude CLI and the confirmation prompt.
+
+    Restores the module globals and stdin on the way out, so a test
+    cannot leave a stub behind for whatever runs next.
+    """
     captured = {}
 
     def fake_call_claude(prompt, timeout=120):
         captured["prompt"] = prompt
+        if isinstance(reply, Exception):
+            raise reply
         return reply
 
     real_call, real_avail = H.call_claude, H.claude_available
+    real_stdin = sys.stdin
     H.call_claude = fake_call_claude
-    H.claude_available = lambda: True
-    stdin = sys.stdin
+    H.claude_available = lambda: available
     sys.stdin = io.StringIO(answer + "\n")
-    buf = io.StringIO()
     try:
+        yield captured
+    finally:
+        H.call_claude, H.claude_available = real_call, real_avail
+        sys.stdin = real_stdin
+
+
+def run(name, reply, answer="y", source=SOURCE, test_name="test_a",
+        available=True):
+    """Run ai_update_docstring with call_claude stubbed."""
+    path = TMP / f"{name}.py"
+    path.write_text(source)
+    buf = io.StringIO()
+    with stubbed(reply, answer, available) as captured:
         with contextlib.redirect_stdout(buf):
             returned = H.ai_update_docstring(
                 path, test_name, STEPS, class_name="TestThing"
             )
-    finally:
-        H.call_claude, H.claude_available = real_call, real_avail
-        sys.stdin = stdin
-    return returned, path.read_text(), buf.getvalue(), captured.get("prompt", "")
+    return (
+        returned,
+        path.read_text(),
+        buf.getvalue(),
+        captured.get("prompt", ""),
+    )
 
 
-def assert_refused(label, returned, after, out, expect):
+def assert_refused(label, returned, after, out, expect, before=SOURCE):
     """Assert the call refused and left the file byte-identical."""
     check(f"{label}: should return False", returned is False)
-    check(f"{label}: file must be unchanged", after == SOURCE)
+    check(f"{label}: file must be unchanged", after == before)
     check(
         f"{label}: expected {expect!r} in output",
         expect in out,
@@ -190,7 +224,9 @@ def test_splice_cannot_escape_the_docstring():
 
 def test_truncated_reply_refused():
     """A reply cut off mid-string is refused."""
-    returned, after, out, _ = run("trunc", '"""Check the thing works.\n\n   Steps:\n   1. Cre')
+    returned, after, out, _ = run(
+        "trunc", '"""Check the thing works.\n\n   Steps:\n   1. Cre'
+    )
     assert_refused("trunc", returned, after, out, "Not updating")
     print("PASS: truncated_reply_refused")
 
@@ -245,22 +281,8 @@ def test_no_docstring_refused():
         "    def test_a(self):\n"
         "        assert True\n"
     )
-    path = TMP / "nodoc.py"
-    path.write_text(src)
-    H.claude_available = lambda: True
-    H.call_claude = lambda p, timeout=120: GOOD
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        returned = H.ai_update_docstring(
-            path, "test_a", STEPS, class_name="TestThing"
-        )
-    check("nodoc: returns False", returned is False)
-    check("nodoc: file unchanged", path.read_text() == src)
-    check(
-        "nodoc: explains why",
-        "no docstring" in buf.getvalue(),
-        buf.getvalue().strip(),
-    )
+    returned, after, out, _ = run("nodoc", GOOD, source=src)
+    assert_refused("nodoc", returned, after, out, "no docstring", before=src)
     print("PASS: no_docstring_refused")
 
 
@@ -271,6 +293,41 @@ def test_missing_function_refused():
     )
     assert_refused("nofn", returned, after, out, "not found")
     print("PASS: missing_function_refused")
+
+
+def test_no_claude_refused():
+    """With no claude CLI the file is never even read."""
+    returned, after, out, prompt = run("noclaude", GOOD, available=False)
+    assert_refused(
+        "noclaude", returned, after, out, "claude CLI not available"
+    )
+    check("noclaude: the CLI was not called", prompt == "", prompt[:80])
+    print("PASS: no_claude_refused")
+
+
+def test_ai_call_failure_refused():
+    """An exception from the CLI is reported, not propagated."""
+    returned, after, out, _ = run("boom", RuntimeError("timed out"))
+    assert_refused("boom", returned, after, out, "AI call failed")
+    check("boom: the reason is shown", "timed out" in out, out.strip())
+    print("PASS: ai_call_failure_refused")
+
+
+def test_unchanged_docstring_is_a_no_op():
+    """An already-correct docstring writes nothing.
+
+    False here means "nothing to write", not "refused" — worth pinning
+    so a caller treating False as failure shows up as a test change.
+    """
+    returned, after, out, _ = run("same", SAME)
+    check("same: returns False", returned is False)
+    check("same: file unchanged", after == SOURCE)
+    check(
+        "same: reported as a no-op, not a refusal",
+        "No changes needed" in out and "REFUSING" not in out,
+        out.strip(),
+    )
+    print("PASS: unchanged_docstring_is_a_no_op")
 
 
 def test_declined_at_prompt():
@@ -297,13 +354,23 @@ if __name__ == "__main__":
         test_trailing_code_refused,
         test_no_docstring_refused,
         test_missing_function_refused,
+        test_no_claude_refused,
+        test_ai_call_failure_refused,
+        test_unchanged_docstring_is_a_no_op,
         test_declined_at_prompt,
     ]
 
-    try:
-        for t in tests:
+    failed = []
+    for t in tests:
+        try:
             t()
-            print()
-        print(f"All {len(tests)} tests passed.")
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print(f"FAIL: {t.__name__}\n  {e}")
+        print()
+
+    if failed:
+        print(f"{len(failed)} of {len(tests)} tests failed:")
+        print(f"  {', '.join(failed)}")
+        sys.exit(1)
+    print(f"All {len(tests)} tests passed.")
