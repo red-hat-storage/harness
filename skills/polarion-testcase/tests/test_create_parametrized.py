@@ -1,70 +1,87 @@
 #!/usr/bin/env python3
 """
-Temp test for extract_parametrize_info and
+Tests for extract_parametrize_info and
 create_parametrized_work_items across several real
 OCS-CI parametrized tests.
 
 Tests covered:
-- deprecated_test_namespace_store_creation_crd  (keyword args, complex tuples)
-- test_check_object_integrity                   (6 param sets, dicts with constants.*)
-- test_respin_mcg_pod_and_check_data_integrity_rpc  (*["val"] splat, polarion_id marks)
-- test_cephfs_subvolume_top_10_ranking          (constants.* values, placeholder IDs)
+- deprecated_test_namespace_store_creation_crd (keyword args, tuples)
+- test_check_object_integrity        (6 param sets, dicts of constants.*)
+- test_respin_mcg_pod_..._rpc        (*["val"] splat, polarion_id marks)
+- test_cephfs_subvolume_top_10_ranking  (constants.* values, resolved)
+
+Nothing here may reach the network: api_call is replaced at import
+time, so a mock aimed at a stale target fails loudly instead of
+POSTing to the live Polarion server.
 
 Usage:
     python tests/test_create_parametrized.py
 """
 
+import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from polarion_tc_helpers import (
-    extract_parametrize_info,
+import polarion_tc_helpers as H  # noqa: E402
+from polarion_tc_helpers import (  # noqa: E402
     create_parametrized_work_items,
+    extract_parametrize_info,
+    get_project_dir,
 )
 
-OCS_CI = Path("/home/ikave/IBMProjects/ocs-ci")
 
-TEST_FILE = (
-    OCS_CI
-    / "tests"
-    / "functional"
-    / "object"
-    / "mcg"
-    / "test_namespace_crd.py"
+def _no_network(method, url, token, body=None):
+    """Stand-in for api_call that refuses to talk to Polarion.
+
+    These tests mock the work-item functions. If a mock ever targets
+    the wrong module again, the real one is reached and lands here —
+    a loud failure rather than an unauthenticated POST to production.
+    """
+    raise AssertionError(
+        f"unmocked Polarion API call: {method} {url}"
+        " — a patch target is stale"
+    )
+
+
+H.api_call = _no_network
+
+# The project under test is configured, not hardcoded — same source the
+# skill itself uses. Every test here needs real OCS-CI files, so
+# without it they all skip rather than silently reporting success.
+PROJECT_DIR = os.environ.get("POLARION_PROJECT_DIR") or get_project_dir()
+OCS_CI = Path(PROJECT_DIR) if PROJECT_DIR else None
+
+SKIPPED = []
+
+
+def _fixture(*parts):
+    """Path to an OCS-CI test module, or None if no project dir."""
+    return OCS_CI.joinpath(*parts) if OCS_CI else None
+
+
+TEST_FILE = _fixture(
+    "tests", "functional", "object", "mcg", "test_namespace_crd.py"
 )
 TEST_NAME = "deprecated_test_namespace_store_creation_crd"
 
-OBJ_INTEGRITY_FILE = (
-    OCS_CI
-    / "tests"
-    / "functional"
-    / "object"
-    / "mcg"
-    / "test_object_integrity.py"
+OBJ_INTEGRITY_FILE = _fixture(
+    "tests", "functional", "object", "mcg", "test_object_integrity.py"
 )
 OBJ_INTEGRITY_NAME = "test_check_object_integrity"
 
-RESPIN_FILE = (
-    OCS_CI
-    / "tests"
-    / "functional"
-    / "object"
-    / "mcg"
-    / "test_namespace_rpc.py"
+RESPIN_FILE = _fixture(
+    "tests", "functional", "object", "mcg", "test_namespace_rpc.py"
 )
 RESPIN_NAME = (
     "test_respin_mcg_pod_and_check_data_integrity_rpc"
 )
 
-SUBVOL_FILE = (
-    OCS_CI
-    / "tests"
-    / "functional"
-    / "ui"
-    / "test_cephfs_subvolume_metrics.py"
+SUBVOL_FILE = _fixture(
+    "tests", "functional", "ui", "test_cephfs_subvolume_metrics.py"
 )
 SUBVOL_NAME = "test_cephfs_subvolume_top_10_ranking"
 
@@ -72,9 +89,24 @@ FAKE_TOKEN = "fake-token"
 FAKE_RELATED = "OCS-2255"
 
 
-def _load_param_info():
-    source = TEST_FILE.read_text()
-    return extract_parametrize_info(source, TEST_NAME)
+def _skip(name, file_path):
+    """Record and report a skip when an upstream fixture is absent.
+
+    Under pytest a bare return counts as a pass, which is the exact
+    "absent fixture reads as success" failure this guards against, so
+    hand the skip to pytest when pytest is the one running. Looked up
+    in sys.modules rather than imported, to keep this file runnable
+    without pytest installed.
+    """
+    SKIPPED.append(name)
+    missing = "no project dir configured" if file_path is None else (
+        f"{file_path.name} not present"
+    )
+    print(f"SKIP: {name} — {missing}")
+    pytest = sys.modules.get("pytest")
+    if pytest is not None:
+        pytest.skip(missing)
+    return None
 
 
 def _load(file_path, test_name):
@@ -82,7 +114,18 @@ def _load(file_path, test_name):
     return extract_parametrize_info(source, test_name)
 
 
+def _load_param_info():
+    return _load(TEST_FILE, TEST_NAME)
+
+
+def _have(file_path):
+    """Return True if an upstream fixture file is available."""
+    return file_path is not None and file_path.exists()
+
+
 def test_extract_parametrize_info():
+    if not _have(TEST_FILE):
+        return _skip("test_extract_parametrize_info", TEST_FILE)
     result = _load_param_info()
 
     assert result is not None, "Should detect parametrize"
@@ -107,6 +150,8 @@ def test_extract_parametrize_info():
 
 
 def test_create_parametrized_work_items():
+    if not _have(TEST_FILE):
+        return _skip("test_create_parametrized_work_items", TEST_FILE)
     param_info = _load_param_info()
     assert param_info is not None
 
@@ -138,15 +183,15 @@ def test_create_parametrized_work_items():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create,
         ) as m_create,
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
             return_value="",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
             return_value="",
         ) as m_link,
     ):
@@ -222,6 +267,8 @@ def test_create_parametrized_work_items():
 
 def test_partial_failure():
     """One param set fails — others still succeed."""
+    if not _have(TEST_FILE):
+        return _skip("test_partial_failure", TEST_FILE)
     param_info = _load_param_info()
 
     base_attrs = {
@@ -250,15 +297,15 @@ def test_partial_failure():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create_with_failure,
         ),
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
             return_value="",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
             return_value="",
         ) as m_link,
     ):
@@ -292,6 +339,8 @@ def test_partial_failure():
 
 def test_no_steps_no_link():
     """Empty steps and no related work item."""
+    if not _have(TEST_FILE):
+        return _skip("test_no_steps_no_link", TEST_FILE)
     param_info = _load_param_info()
 
     base_attrs = {
@@ -311,14 +360,14 @@ def test_no_steps_no_link():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create,
         ),
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
         ) as m_link,
     ):
         results = create_parametrized_work_items(
@@ -346,6 +395,8 @@ def test_no_steps_no_link():
 def test_extract_object_integrity():
     """6 param sets, keyword argnames (string), complex dicts,
     no polarion_id in marks."""
+    if not _have(OBJ_INTEGRITY_FILE):
+        return _skip("test_extract_object_integrity", OBJ_INTEGRITY_FILE)
     result = _load(OBJ_INTEGRITY_FILE, OBJ_INTEGRITY_NAME)
 
     assert result is not None, "Should detect parametrize"
@@ -378,6 +429,8 @@ def test_extract_object_integrity():
 
 def test_create_object_integrity():
     """Create 6 work items for test_check_object_integrity."""
+    if not _have(OBJ_INTEGRITY_FILE):
+        return _skip("test_create_object_integrity", OBJ_INTEGRITY_FILE)
     param_info = _load(
         OBJ_INTEGRITY_FILE, OBJ_INTEGRITY_NAME
     )
@@ -410,15 +463,15 @@ def test_create_object_integrity():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create,
         ) as m_create,
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
             return_value="",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
             return_value="",
         ) as m_link,
     ):
@@ -460,6 +513,8 @@ def test_create_object_integrity():
 def test_extract_respin():
     """3 param sets, keyword argnames (list), *[] splat values,
     each has polarion_id in marks."""
+    if not _have(RESPIN_FILE):
+        return _skip("test_extract_respin", RESPIN_FILE)
     result = _load(RESPIN_FILE, RESPIN_NAME)
 
     assert result is not None, "Should detect parametrize"
@@ -471,11 +526,18 @@ def test_extract_respin():
         assert ps["index"] == i
         assert "mcg_pod" in ps["params"]
 
-    # All three use *["val"] splat which produces <expr>
-    for ps in result:
-        assert ps["params"]["mcg_pod"] == "<expr>"
+    # A *["val"] splat has no literal value, so it is unparsed back to
+    # source. It used to collapse to "<expr>", which lost the pod name
+    # and gave every param set the same automationscript suffix.
+    values = [ps["params"]["mcg_pod"] for ps in result]
+    assert values == [
+        "*['noobaa-db']",
+        "*['noobaa-core']",
+        "*['noobaa-operator']",
+    ], f"Unexpected splat rendering: {values}"
 
-    # Each has a distinct polarion_id
+    # Each has a distinct polarion_id, in param order. Exact IDs are
+    # asserted because they prove each mark maps to its own param set.
     ids = [ps["existing_polarion_id"] for ps in result]
     assert ids == ["OCS-2291", "OCS-2319", "OCS-2320"]
 
@@ -489,6 +551,8 @@ def test_extract_respin():
 
 def test_create_respin():
     """Create 3 work items for respin test."""
+    if not _have(RESPIN_FILE):
+        return _skip("test_create_respin", RESPIN_FILE)
     param_info = _load(RESPIN_FILE, RESPIN_NAME)
 
     base_attrs = {
@@ -515,15 +579,15 @@ def test_create_respin():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create,
         ) as m_create,
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
             return_value="",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
             return_value="",
         ),
     ):
@@ -543,10 +607,18 @@ def test_create_respin():
         assert r["wi_id"]
         assert r["error"] == ""
 
-    # All automationscripts contain [<expr>] since splat values
-    for i, c in enumerate(m_create.call_args_list):
-        attrs = c[0][1]
-        assert "[<expr>]" in attrs["automationscript"]
+    # The splat value reaches the automationscript suffix, so the three
+    # work items are distinguishable. Under the old "<expr>" rendering
+    # all three suffixes were identical.
+    scripts = [
+        c[0][1]["automationscript"] for c in m_create.call_args_list
+    ]
+    assert scripts == [
+        f"{RESPIN_NAME}[*['noobaa-db']]",
+        f"{RESPIN_NAME}[*['noobaa-core']]",
+        f"{RESPIN_NAME}[*['noobaa-operator']]",
+    ], f"Unexpected automationscripts: {scripts}"
+    assert len(set(scripts)) == 3
 
     print("PASS: create_respin")
     print(f"  Created: {[r['wi_id'] for r in results]}")
@@ -556,8 +628,9 @@ def test_create_respin():
 
 
 def test_extract_subvolume():
-    """3 param sets, constants.* values (<expr>),
-    placeholder OCS-XXXX polarion IDs."""
+    """3 param sets, constants.* values resolved to their literals."""
+    if not _have(SUBVOL_FILE):
+        return _skip("test_extract_subvolume", SUBVOL_FILE)
     result = _load(SUBVOL_FILE, SUBVOL_NAME)
 
     assert result is not None, "Should detect parametrize"
@@ -569,13 +642,23 @@ def test_extract_subvolume():
         assert ps["index"] == i
         assert "metric" in ps["params"]
 
-    # All values are constants.* references
-    for ps in result:
-        assert ps["params"]["metric"] == "<expr>"
+    # A constants.* reference is followed into the imported module and
+    # replaced by its literal. These used to come back as "<expr>",
+    # which put no usable metric name in the title.
+    values = [ps["params"]["metric"] for ps in result]
+    assert all(isinstance(v, str) for v in values), values
+    assert not any(
+        v == "<expr>" or v.startswith("constants.") for v in values
+    ), f"constants were not resolved: {values}"
+    assert len(set(values)) == 3, f"metrics not distinct: {values}"
 
-    # All have the placeholder OCS-XXXX
-    for ps in result:
-        assert ps["existing_polarion_id"] == "OCS-XXXX"
+    # IDs are asserted by shape, not value: this fixture is an upstream
+    # file and its placeholder OCS-XXXX IDs have since become real ones.
+    ids = [ps["existing_polarion_id"] for ps in result]
+    assert all(
+        i and re.fullmatch(r"OCS-(\d+|X+)", i) for i in ids
+    ), f"Unexpected polarion IDs: {ids}"
+    assert len(set(ids)) == 3, f"IDs not distinct: {ids}"
 
     print("PASS: extract_subvolume")
     for ps in result:
@@ -587,6 +670,8 @@ def test_extract_subvolume():
 
 def test_create_subvolume():
     """Create 3 work items for subvolume ranking test."""
+    if not _have(SUBVOL_FILE):
+        return _skip("test_create_subvolume", SUBVOL_FILE)
     param_info = _load(SUBVOL_FILE, SUBVOL_NAME)
 
     base_attrs = {
@@ -617,15 +702,15 @@ def test_create_subvolume():
 
     with (
         patch(
-            "create_polarion_tc.create_work_item",
+            "polarion_tc_helpers.create_work_item",
             side_effect=mock_create,
         ) as m_create,
         patch(
-            "create_polarion_tc.post_test_steps",
+            "polarion_tc_helpers.post_test_steps",
             return_value="",
         ) as m_steps,
         patch(
-            "create_polarion_tc.link_work_item",
+            "polarion_tc_helpers.link_work_item",
             return_value="",
         ) as m_link,
     ):
@@ -647,17 +732,22 @@ def test_create_subvolume():
         assert r["wi_id"]
         assert r["error"] == ""
 
-    # All titles have (metric=<expr>) suffix
-    for c in m_create.call_args_list:
-        attrs = c[0][1]
-        assert attrs["title"].endswith("(metric=<expr>)")
-
-    # All automationscripts end with [<expr>]
-    for c in m_create.call_args_list:
-        attrs = c[0][1]
-        assert attrs["automationscript"] == (
-            f"{SUBVOL_NAME}[<expr>]"
-        )
+    # The resolved metric name reaches both the title and the
+    # automationscript, so the three work items are distinguishable.
+    # Under the old "<expr>" rendering all three were identical.
+    metrics = [ps["params"]["metric"] for ps in param_info]
+    titles = [c[0][1]["title"] for c in m_create.call_args_list]
+    scripts = [
+        c[0][1]["automationscript"] for c in m_create.call_args_list
+    ]
+    assert titles == [
+        f"Test CephFS Subvolume Top 10 Ranking (metric={m})"
+        for m in metrics
+    ], f"Unexpected titles: {titles}"
+    assert scripts == [
+        f"{SUBVOL_NAME}[{m}]" for m in metrics
+    ], f"Unexpected automationscripts: {scripts}"
+    assert len(set(scripts)) == 3
 
     print("PASS: create_subvolume")
     print(f"  Created: {[r['wi_id'] for r in results]}")
@@ -684,8 +774,23 @@ if __name__ == "__main__":
         test_create_subvolume,
     ]
 
+    failed = []
     for t in tests:
-        t()
+        try:
+            t()
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print(f"FAIL: {t.__name__}\n  {e}")
         print()
 
-    print(f"All {len(tests)} tests passed.")
+    if failed:
+        print(f"{len(failed)} of {len(tests)} tests failed:")
+        print(f"  {', '.join(failed)}")
+        sys.exit(1)
+    passed = len(tests) - len(SKIPPED)
+    if not passed:
+        print(f"No tests ran — all {len(SKIPPED)} skipped.")
+        sys.exit(1)
+    print(f"All {passed} tests passed.")
+    if SKIPPED:
+        print(f"{len(SKIPPED)} skipped: {', '.join(SKIPPED)}")

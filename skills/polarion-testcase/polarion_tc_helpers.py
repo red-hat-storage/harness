@@ -19,13 +19,15 @@ from constants import (
     ACRONYMS,
     CONF_FILE,
     CONF_TITLE_PROMPT,
-    DECORATOR_PROMPT,
     DEFAULT_EXPECTED,
     DOCSTRING_PROMPT,
     EXTRACT_PROMPT,
+    MARKS_MODULE,
+    MAX_LINE,
     POLARION_BASE,
     POLARION_REDIRECT,
     PROJECT,
+    TESTLIB_MODULE,
     TOKEN_FILE,
 )
 
@@ -393,18 +395,7 @@ def extract_parametrize_info(
     if not fn_node:
         return None
 
-    for dec in fn_node.decorator_list:
-        if not isinstance(dec, ast.Call):
-            continue
-        func = dec.func
-        if not (
-            isinstance(func, ast.Attribute)
-            and func.attr == "parametrize"
-            and isinstance(func.value, ast.Attribute)
-            and func.value.attr == "mark"
-        ):
-            continue
-
+    for dec in _parametrize_decorators(fn_node):
         kw_map = {
             kw.arg: kw.value for kw in dec.keywords
         }
@@ -413,11 +404,7 @@ def extract_parametrize_info(
             if len(dec.args) >= 1
             else kw_map.get("argnames")
         )
-        argvalues_node = (
-            dec.args[1]
-            if len(dec.args) >= 2
-            else kw_map.get("argvalues")
-        )
+        argvalues_node = _argvalues(dec)
         if argnames_node is None or argvalues_node is None:
             continue
 
@@ -1195,46 +1182,461 @@ def create_parametrized_work_items(
     return results
 
 
-# ── File editing (AI-assisted) ───────────────────────────────────────────────
+# ── File editing ─────────────────────────────────────────────────────────────
 
 
-def ai_add_polarion_decorator(
-    file_path: Path, test_name: str, wi_id: str
-) -> bool:
-    """Add @polarion_id decorator to a test function via AI."""
-    if not claude_available():
-        print(
-            "  claude CLI not available"
-            " — cannot add decorator via AI."
+def _defined_names(tree: ast.AST) -> set:
+    """Return every function and class name defined in a parsed tree."""
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
         )
-        return False
+    }
 
-    source = file_path.read_text()
-    prompt = DECORATOR_PROMPT.format(
-        wi_id=wi_id, test_name=test_name, source=source
-    )
+
+def validate_edit(
+    source: str, updated: str, check_size: bool = True
+) -> str:
+    """Return an error string if an edited file looks unsafe to write.
+
+    Guards against a truncated or summarised rewrite silently destroying
+    the file. Returns "" when the edit is safe.
+    """
+    if not updated.strip():
+        return "the new content is empty"
+    if updated.lstrip().startswith("```"):
+        return "the new content is wrapped in markdown fences"
     try:
-        updated = call_claude(prompt)
-    except Exception as e:
-        print(f"  AI call failed: {e}")
+        new_tree = ast.parse(updated)
+        # ast.parse alone accepts things the compiler rejects, such as
+        # a repeated keyword argument, so compile it too.
+        compile(updated, "<edit>", "exec")
+    except SyntaxError as e:
+        return f"the new content is not valid Python ({e})"
+
+    dropped = _defined_names(ast.parse(source)) - _defined_names(new_tree)
+    if dropped:
+        return (
+            "the new content is missing "
+            f"{len(dropped)} definition(s): {', '.join(sorted(dropped))}"
+        )
+    # Only meaningful when the whole file was rewritten. A splice is
+    # confined to one node, so shrinking there is a legitimate edit.
+    if check_size and len(updated) < len(source) * 0.9:
+        shrink = 100 - int(len(updated) / len(source) * 100)
+        return f"the new content is {shrink}% smaller than the original"
+    return ""
+
+
+def apply_edit(
+    file_path: Path,
+    source: str,
+    updated: str,
+    confirm: bool = True,
+    check_size: bool = True,
+) -> bool:
+    """Validate, show, confirm and write an edited file."""
+    if updated == source:
+        print("  No changes needed.")
         return False
 
-    if updated == source:
-        print("  AI returned no changes.")
+    problem = validate_edit(source, updated, check_size=check_size)
+    if problem:
+        print(f"  REFUSING to write {file_path.name}: {problem}.")
+        print("  The file has been left untouched.")
         return False
 
     show_diff(file_path.name, source, updated)
-    if not ask("Apply this change?"):
+    if confirm and not ask("Apply this change?"):
         return False
 
     file_path.write_text(updated)
     return True
 
 
-def ai_update_docstring(
-    file_path: Path, test_name: str, steps: list
+def _load_target(file_path: Path, test_name: str, class_name: str = None):
+    """Read a file and locate a test function.
+
+    Returns (source, function node), or (None, None) after reporting
+    why the edit cannot proceed.
+    """
+    source = file_path.read_text()
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        print(f"  Cannot parse {file_path.name}: {e}")
+        return None, None
+
+    func = find_function_node(source, test_name, class_name)
+    if func is None:
+        print(f"  Function {test_name} not found in {file_path.name}.")
+        return None, None
+    return source, func
+
+
+def _decorator_name(node: ast.AST) -> str:
+    """Return the dotted name of a decorator expression."""
+    target = node.func if isinstance(node, ast.Call) else node
+    parts = []
+    while isinstance(target, ast.Attribute):
+        parts.append(target.attr)
+        target = target.value
+    if isinstance(target, ast.Name):
+        parts.append(target.id)
+    return ".".join(reversed(parts))
+
+
+def _existing_polarion_ids(func: ast.AST) -> list:
+    """Return the IDs of any polarion_id decorators already present.
+
+    Matches on the last dotted segment so that both the bare
+    `@polarion_id(...)` and the `@pytest.mark.polarion_id(...)` form
+    are recognised.
+    """
+    ids = []
+    for dec in func.decorator_list:
+        if _decorator_name(dec).split(".")[-1] != "polarion_id":
+            continue
+        ids += [
+            arg.value
+            for arg in getattr(dec, "args", [])
+            if isinstance(arg, ast.Constant)
+        ]
+    return ids
+
+
+def _imports_polarion_id(tree: ast.AST) -> bool:
+    """Return True if polarion_id is already imported anywhere."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and any(a.name == "polarion_id" for a in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def _import_from(tree: ast.AST, module: str):
+    """Return the top-level `from <module> import ...` node, or None."""
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == module:
+            return node
+    return None
+
+
+def _add_to_import(lines: list, node: ast.ImportFrom) -> None:
+    """Add polarion_id to an existing import, in place."""
+    start, end = node.lineno - 1, node.end_lineno - 1
+    if end > start:
+        # Parenthesised import: add one name line before the closing ")".
+        indent = re.match(r"\s*", lines[start + 1]).group(0) or "    "
+        lines.insert(end, f"{indent}polarion_id,\n")
+        return
+
+    names = [a.name for a in node.names] + ["polarion_id"]
+    single = f"from {node.module} import {', '.join(names)}\n"
+    if len(single.rstrip("\n")) <= MAX_LINE:
+        lines[start] = single
+        return
+    # Too long for one line — switch to the parenthesised form.
+    block = [f"from {node.module} import (\n"]
+    block += [f"    {n},\n" for n in names]
+    block.append(")\n")
+    lines[start : start + 1] = block
+
+
+def _add_import(lines: list, tree: ast.AST) -> None:
+    """Make polarion_id importable, reusing the file's own convention."""
+    for module in (TESTLIB_MODULE, MARKS_MODULE):
+        node = _import_from(tree, module)
+        if node is not None:
+            _add_to_import(lines, node)
+            return
+
+    # No suitable import to extend — add one after the last top-level import.
+    last = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last = node.end_lineno
+    lines.insert(last, f"from {MARKS_MODULE} import polarion_id\n")
+
+
+def _splice(source: str, node: ast.AST, new_text: str) -> str:
+    """Replace a node's exact source span with new_text.
+
+    col_offset values from ast are utf-8 byte offsets, so the start and
+    end lines are sliced as bytes to stay correct on non-ASCII lines.
+    """
+    lines = source.splitlines(keepends=True)
+    head = lines[node.lineno - 1].encode()[: node.col_offset].decode()
+    tail = lines[node.end_lineno - 1].encode()[node.end_col_offset :].decode()
+    return "".join(
+        lines[: node.lineno - 1]
+        + [head + new_text + tail]
+        + lines[node.end_lineno :]
+    )
+
+
+def _insert_at(source: str, lineno: int, col: int, text: str) -> str:
+    """Insert text at a (1-based line, utf-8 column) position."""
+    lines = source.splitlines(keepends=True)
+    raw = lines[lineno - 1].encode()
+    lines[lineno - 1] = (raw[:col].decode() + text + raw[col:].decode())
+    return "".join(lines)
+
+
+def _segment(source: str, node: ast.AST) -> str:
+    """Return the original source text of a node."""
+    return ast.get_source_segment(source, node) or ""
+
+
+def _parametrize_decorators(func: ast.AST) -> list:
+    """Return the @pytest.mark.parametrize decorators on a function."""
+    found = []
+    for dec in func.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        f = dec.func
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "parametrize"
+            and isinstance(f.value, ast.Attribute)
+            and f.value.attr == "mark"
+            and isinstance(f.value.value, ast.Name)
+            and f.value.value.id == "pytest"
+        ):
+            found.append(dec)
+    return found
+
+
+def _argvalues(dec: ast.Call):
+    """Return the argvalues node of a parametrize decorator, or None."""
+    kw = {k.arg: k.value for k in dec.keywords}
+    if len(dec.args) >= 2:
+        return dec.args[1]
+    return kw.get("argvalues")
+
+
+def _is_pytest_param(node: ast.AST) -> bool:
+    """Return True if node is a pytest.param(...) call."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "param"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pytest"
+    )
+
+
+def _marks_keyword(node: ast.AST):
+    """Return the marks= keyword node of a pytest.param call, or None."""
+    if not isinstance(node, ast.Call):
+        return None
+    for kw in node.keywords:
+        if kw.arg == "marks":
+            return kw
+    return None
+
+
+def _polarion_ids_in(node: ast.AST) -> list:
+    """Return IDs of any polarion_id marks inside an expression."""
+    ids = []
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        name = (
+            func.attr
+            if isinstance(func, ast.Attribute)
+            else getattr(func, "id", "")
+        )
+        if name != "polarion_id":
+            continue
+        ids += [
+            a.value for a in sub.args if isinstance(a, ast.Constant)
+        ]
+    return ids
+
+
+def _marks_elements(source: str, marks_kw, mark: str) -> list:
+    """Return the marks entries, with the new mark appended."""
+    if marks_kw is None:
+        return [mark]
+    value = marks_kw.value
+    if isinstance(value, (ast.List, ast.Tuple)):
+        return [_segment(source, e) for e in value.elts] + [mark]
+    return [_segment(source, value), mark]
+
+
+def _bare_param_args(source: str, node: ast.AST) -> list:
+    """Return the argument parts of an argvalue given without pytest.param.
+
+    A tuple maps to several argnames, so it is unpacked.
+    """
+    if isinstance(node, ast.Tuple):
+        return [_segment(source, e) for e in node.elts]
+    return [_segment(source, node)]
+
+
+def add_param_polarion_id(
+    file_path: Path,
+    test_name: str,
+    param_index: int,
+    wi_id: str,
+    class_name: str = None,
+    confirm: bool = True,
 ) -> bool:
-    """Update the Steps section in a test function's docstring via AI."""
+    """Add a polarion_id mark to one pytest.param of a parametrized test.
+
+    Done with ast, so only the targeted param set is rewritten. Handles
+    a param with no marks, an existing single mark, an existing list or
+    tuple of marks, and a bare argvalue that is not wrapped in
+    pytest.param at all.
+    """
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
+        return False
+
+    if _existing_polarion_ids(func):
+        print(
+            f"  {test_name} already carries a function-level"
+            " @polarion_id — refusing to also set a per-param ID."
+        )
+        return False
+
+    decs = _parametrize_decorators(func)
+    if not decs:
+        print(f"  {test_name} is not parametrized with pytest.mark.parametrize.")
+        return False
+    if len(decs) > 1:
+        print(
+            f"  {test_name} has {len(decs)} parametrize decorators —"
+            " a single param index is ambiguous. Edit it by hand."
+        )
+        return False
+
+    argvalues = _argvalues(decs[0])
+    if not isinstance(argvalues, (ast.List, ast.Tuple)):
+        print("  argvalues is not a literal list — cannot index it.")
+        return False
+    if not 0 <= param_index < len(argvalues.elts):
+        print(
+            f"  param index {param_index} out of range"
+            f" (0..{len(argvalues.elts) - 1})."
+        )
+        return False
+
+    node = argvalues.elts[param_index]
+    mark = f'pytest.mark.polarion_id("{wi_id}")'
+
+    present = _polarion_ids_in(node)
+    if present:
+        print(
+            f"  param {param_index} already has polarion_id"
+            f"({', '.join(repr(p) for p in present)})"
+            " — leaving it alone."
+        )
+        return False
+
+    marks_kw = _marks_keyword(node)
+    elements = _marks_elements(source, marks_kw, mark)
+
+    if not _is_pytest_param(node):
+        # A bare value or tuple: wrap it so it can carry marks.
+        args = _bare_param_args(source, node)
+        updated = _splice(
+            source,
+            node,
+            f"pytest.param({', '.join(args)}, marks={mark})",
+        )
+    else:
+        if marks_kw is None:
+            # Insert just after the last argument, which keeps any
+            # trailing comma and the existing layout intact.
+            tail = (node.args + [k.value for k in node.keywords]) or None
+            if tail:
+                last = max(
+                    tail, key=lambda n: (n.end_lineno, n.end_col_offset)
+                )
+                updated = _insert_at(
+                    source, last.end_lineno, last.end_col_offset,
+                    f", marks={mark}",
+                )
+            else:
+                updated = _insert_at(
+                    source, node.end_lineno, node.end_col_offset - 1,
+                    f"marks={mark}",
+                )
+        else:
+            # Re-render the whole marks value, wrapping it over several
+            # lines if the new entry makes it too wide.
+            updated = _splice(
+                source,
+                marks_kw.value,
+                "[" + ", ".join(elements) + "]",
+            )
+
+    return apply_edit(file_path, source, updated, confirm=confirm)
+
+
+def add_polarion_decorator(
+    file_path: Path, test_name: str, wi_id: str, class_name: str = None
+) -> bool:
+    """Add @polarion_id("<wi_id>") to a test function.
+
+    This is a purely mechanical edit done with ast, so the rest of the
+    file is untouched by construction.
+    """
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
+        return False
+    tree = ast.parse(source)
+
+    present = _existing_polarion_ids(func)
+    if wi_id in present:
+        print(f'  {test_name} already has @polarion_id("{wi_id}").')
+        return False
+    if present:
+        print(
+            f"  {test_name} already has @polarion_id"
+            f"({', '.join(repr(p) for p in present)})"
+            " — leaving it alone."
+        )
+        return False
+
+    lines = source.splitlines(keepends=True)
+    # Insert the decorator first: it sits below the imports, so the
+    # import line numbers stay valid for the second edit.
+    indent = re.match(r"\s*", lines[func.lineno - 1]).group(0)
+    lines.insert(func.lineno - 1, f'{indent}@polarion_id("{wi_id}")\n')
+    if not _imports_polarion_id(tree):
+        _add_import(lines, tree)
+
+    return apply_edit(file_path, source, "".join(lines))
+
+
+def _docstring_node(func: ast.AST):
+    """Return the docstring's Expr node for a function, or None."""
+    if not func.body:
+        return None
+    first = func.body[0]
+    if isinstance(first, ast.Expr) and isinstance(
+        first.value, ast.Constant
+    ) and isinstance(first.value.value, str):
+        return first
+    return None
+
+
+def ai_update_docstring(
+    file_path: Path, test_name: str, steps: list, class_name: str = None
+) -> bool:
+    """Rewrite the Steps section of a test's docstring.
+
+    The model is asked for the docstring alone, never the whole file.
+    Its answer is spliced into the docstring's exact ast span, so no
+    edit can land outside those lines.
+    """
     if not claude_available():
         print(
             "  claude CLI not available"
@@ -1242,7 +1644,18 @@ def ai_update_docstring(
         )
         return False
 
-    source = file_path.read_text()
+    source, func = _load_target(file_path, test_name, class_name)
+    if source is None:
+        return False
+
+    node = _docstring_node(func)
+    if node is None:
+        print(
+            f"  {test_name} has no docstring to update."
+            " Add one first, then re-run."
+        )
+        return False
+
     steps_text = "\n".join(
         f"{i}. {s['step']}"
         + (
@@ -1255,24 +1668,50 @@ def ai_update_docstring(
     prompt = DOCSTRING_PROMPT.format(
         test_name=test_name,
         steps_text=steps_text,
-        source=source,
+        docstring=_segment(source, node),
     )
     try:
-        updated = call_claude(prompt)
+        new_docstring = call_claude(prompt).strip()
     except Exception as e:
         print(f"  AI call failed: {e}")
         return False
 
-    if updated == source:
-        print("  AI returned no changes.")
+    problem = _check_docstring(new_docstring)
+    if problem:
+        print(f"  Not updating the docstring: {problem}.")
         return False
 
-    show_diff(file_path.name, source, updated)
-    if not ask("Apply this change?"):
-        return False
+    # check_size is off because the edit cannot reach past the
+    # docstring node, so a shorter docstring is a valid result.
+    return apply_edit(
+        file_path,
+        source,
+        _splice(source, node, new_docstring),
+        check_size=False,
+    )
 
-    file_path.write_text(updated)
-    return True
+
+def _check_docstring(text: str) -> str:
+    """Return a reason the model's docstring is unusable, else ""."""
+    if not text:
+        return "the model returned nothing"
+    if text.startswith("```"):
+        return "the model wrapped it in markdown fences"
+    if not re.match(r'^[rubfRUBF]*("""|\'\'\')', text):
+        return "it does not start with a triple-quote"
+    try:
+        parsed = ast.parse(text)
+    except SyntaxError:
+        return "it is not a valid Python string literal"
+    body = parsed.body
+    if (
+        len(body) != 1
+        or not isinstance(body[0], ast.Expr)
+        or not isinstance(body[0].value, ast.Constant)
+        or not isinstance(body[0].value.value, str)
+    ):
+        return "it is not a single string literal"
+    return ""
 
 
 # ── Display helpers ──────────────────────────────────────────────────────────

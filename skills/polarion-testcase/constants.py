@@ -14,6 +14,12 @@ POLARION_REDIRECT = f"{_polarion_root}/redirect"
 TOKEN_FILE = os.path.expanduser("~/.polarion-token")
 CONF_FILE = os.path.expanduser("~/.polarion-testcase.conf")
 
+# Modules that re-export the polarion_id mark, preferred in this order
+# when making it importable in a test file.
+TESTLIB_MODULE = "ocs_ci.framework.testlib"
+MARKS_MODULE = "ocs_ci.framework.pytest_customization.marks"
+MAX_LINE = 79
+
 ACRONYMS = {
     "lso", "cli", "odf", "ocp", "obc", "mcg", "rgw", "mco",
     "ui", "api", "s3", "ocs", "kms", "aws", "gcp", "ibm",
@@ -85,37 +91,30 @@ Code:
 ```
 """
 
-DECORATOR_PROMPT = """\
-Add the decorator `@polarion_id("{wi_id}")` to the Python function \
-`{test_name}` in the code below.
+# Note: adding the @polarion_id decorator is done with ast in
+# polarion_tc_helpers.add_polarion_decorator, not by an LLM rewrite.
+# Asking a model to echo back a whole file risks it truncating or
+# summarising the parts it was told not to change.
+
+# Only the docstring body is requested back. It is spliced into the
+# docstring's exact ast span, so the model never retypes the file and
+# cannot truncate it or drift outside the docstring.
+DOCSTRING_PROMPT = """\
+Rewrite the docstring below for the function `{test_name}`.
 
 Rules:
-- Place `@polarion_id("{wi_id}")` immediately above the `def {test_name}` \
-line, after any existing decorators on that function.
-- If `from ocs_ci.framework.testlib import` is present and does not already \
-contain `polarion_id`, add `polarion_id` to that import alphabetically.
-- Do NOT change anything else in the file.
-- Return ONLY the complete updated file content, with no markdown fences and \
-no explanation.
-
-Current file:
-{source}
-"""
-
-DOCSTRING_PROMPT = """\
-Update the docstring of the function `{test_name}` in the code below.
-Replace its `Steps:` section with the steps listed here.
-If there is no `Steps:` section, add one before the closing triple-quote.
-Do NOT change any other part of the docstring or any other part of the file.
+- Replace its `Steps:` section with the steps listed here. If there is no \
+`Steps:` section, add one at the end, after any existing sections.
+- Keep the summary line and every other section exactly as they are.
+- Keep the existing indentation and the surrounding triple quotes.
+- Return ONLY the docstring, from its opening triple-quote to its closing \
+triple-quote, with no markdown fences and no explanation.
 
 New steps:
 {steps_text}
 
-Return ONLY the complete updated file content, with no markdown fences and \
-no explanation.
-
-Current file:
-{source}
+Current docstring:
+{docstring}
 """
 
 CONF_TITLE_PROMPT = """\

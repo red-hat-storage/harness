@@ -156,7 +156,8 @@ What it does (update mode):
   1. Validates the work item ID
   2. If a test file or steps-file is specified: extracts steps, shows preview
   3. Posts steps and/or links to the existing work item via update_polarion_tc.py
-  4. Reports results (no decorator/docstring offers)
+  4. Reports results, then offers to add the ID to the test file if it is
+     missing (no docstring offer — the test case already exists)
 
 File structure:
   create_polarion_tc.py    — Create mode entry point
@@ -270,8 +271,12 @@ If multiple files match, report them and stop — ask the user to pass the full
 ### Step 2.1: Check for Existing Polarion ID (TEST FILE MODE only)
 
 Read the test file and look at the decorators on the target test function.
-If the function already has a `@polarion_id("OCS-XXXX")` decorator, warn
-the user and ask for confirmation before proceeding.
+If the function already has a polarion_id decorator, warn the user and ask
+for confirmation before proceeding.
+
+Both spellings count, and the second is the more common one in OCS-CI:
+- `@polarion_id("OCS-XXXX")`
+- `@pytest.mark.polarion_id("OCS-XXXX")`
 
 Print:
 ```
@@ -609,10 +614,21 @@ args; otherwise use the auto-extracted text from Step 3.
   The stdin pipe remains `printf 'y\nn\nn\n'` (same as non-parametrized).
 - Neither → normal non-parametrized flow.
 
-The `y/n` answers for non-parametrized correspond to:
+The `y/n` answers correspond to the script's three prompts, in order:
 1. "Create this Polarion test case?" → `y`
-2. "Add @polarion_id(...) decorator?" → `n`  (we handle this correctly in Step 5)
+2. The polarion_id prompt → `n`
 3. "Update test docstring Steps section?" → `n`
+
+Answer `n` to 2 and 3 because Step 5 offers the user a single combined
+choice over both edits, rather than two separate yes/no questions in a
+fixed order. The script's own edits are safe to use when it is run
+directly — they are `ast`-based — but going through Step 5 keeps one
+confirmation point and one diff.
+
+Prompt 2 is worded differently depending on the mode, so match on
+position, not on text:
+- non-parametrized: `Add @polarion_id("OCS-XXXX") decorator to <file>?`
+- with `--param-index N`: `Add polarion_id("OCS-XXXX") to param set N in <file>?`
 
 Capture and display the full output.
 
@@ -667,9 +683,13 @@ function's docstring. If the function has no docstring, create one. Format:
 ```
 
 **Option 1 or 3 — Add @polarion_id decorator:**
-Using the Edit tool:
-- Ensure `polarion_id` is in the `from ocs_ci.framework.testlib import (...)`
-  block (insert alphabetically if missing).
+Using the Edit tool. Never rewrite the whole file — make a targeted edit of
+the decorator line and the import only.
+- Ensure `polarion_id` is imported. Extend the file's existing
+  `from ocs_ci.framework.testlib import (...)` block if it has one, else its
+  `from ocs_ci.framework.pytest_customization.marks import (...)` block
+  (both re-export `polarion_id`). Only if the file has neither, add
+  `from ocs_ci.framework.pytest_customization.marks import polarion_id`.
 - For a **non-parametrized** test or `param=<N>`: place `@polarion_id("<NEW_ID>")`
   as the **last** decorator on the test method, just before `def`.
 - For a **single param set** (`param=<N>`): place the `polarion_id` inside the
@@ -742,6 +762,39 @@ If the argvalues are plain tuples (not `pytest.param()`), wrap them:
 
 **Option 2 — Do nothing:** skip file edits entirely.
 
+### Step 5.1: Verify the Edit (CREATE AND UPDATE MODE)
+
+Run this automatically after any file edit, in Step 5 or Step 5U — the
+non-parametrized path, the parametrized path, and docstring edits as
+well as IDs. Do not ask the user anything; report one line.
+
+Read the changed region of the test file back and confirm:
+
+1. **Placement.** Each new `polarion_id` sits on the intended target: the
+   function for a non-parametrized test, or the specific `pytest.param()`
+   entry for a param set. A per-param ID must never appear as a
+   function-level decorator, or vice versa.
+2. **Semantics.** For a parametrized test, the param set the ID landed on
+   matches the work item it was created for. Compare the param's values
+   or its `ids=` label against that work item's title. This is the one
+   check the scripts cannot make: they guarantee the ID is on param N,
+   not that param N is the scenario that work item describes.
+3. **Scope.** Nothing outside the decorator, the import, the `marks=`
+   entry, and the docstring changed.
+
+If everything matches, report a single line, for example:
+
+```
+Verified: OCS-8003 on param set 3 (AZURE-OC-1), matches the work item title.
+```
+
+If something is wrong, say so and stop — do not rewrite the file to
+"fix" it. Report which ID landed where and what you expected, and let
+the user re-run with the right `--param-index`. Guessing at the intended
+param set is exactly the failure this check exists to catch.
+
+Formatting is not your concern here: ocs-ci runs `black` in pre-commit.
+
 ### Step 4U: Run the Python Script (UPDATE MODE)
 
 Skip this step if mode is `create`.
@@ -786,8 +839,7 @@ If the script exits non-zero, show the error and stop.
 
 ### Step 5U: Report Result (UPDATE MODE)
 
-Print the update summary. No decorator/docstring offers since the test case
-already exists.
+Print the update summary.
 
 ```
 Updated Polarion test case: OCS-XXXX
@@ -795,5 +847,26 @@ Steps:  <N> test step(s) posted (if steps were posted)
 Linked: OCS-YYYY (if a link was added)
 URL:    https://polarion.engineering.redhat.com/polarion/redirect/project/OpenShiftContainerStorage/workitem?id=OCS-XXXX
 ```
+
+**Then offer to put the ID in the test file, but only if it is missing.**
+
+This applies when `--test-path` and `--test-name` were given. Check the
+target function for an existing ID, counting both `@polarion_id(...)` and
+`@pytest.mark.polarion_id(...)`, and for a parametrized test also the
+`polarion_id` marks inside each `pytest.param()`.
+
+- Already has the same ID → say so and stop. Nothing to do.
+- Already has a **different** ID → report both and stop. Do not replace it;
+  that is the user's call, not a mechanical edit.
+- No ID → ask using AskUserQuestion:
+  "This test has no polarion_id. Add `@polarion_id("OCS-XXXX")` to
+  <file>?" with options "Yes, add it" and "No, leave the file alone".
+
+If the user says yes, make the edit with the Edit tool following the
+placement and import rules in Step 5 ("Option 1 or 3"), then run Step 5.1.
+
+Never rewrite the whole file, and do not touch the docstring here. Update
+mode is for a test case that already exists, so the only thing worth
+adding to the source is the ID that was previously missing.
 
 Then stop.
